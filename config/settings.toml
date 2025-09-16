@@ -1,0 +1,49 @@
+[device]
+input_samplerate = 48000
+output_samplerate = 48000
+input_device = ""
+output_device = ""
+
+[asr]
+whisper_model = "large-v3-turbo"
+device = "cpu"
+compute_type = "int8"
+task = "translate"
+language = "ko"
+beam_size = 1
+vad = true
+
+[vad]
+frame_ms =30
+aggressiveness = 3
+min_speech_sec = 0.30
+max_utterance_sec = 9
+silence_end_ms = 400
+
+[tts]
+engine = "edge"
+voice = "en-US-AriaNeural"
+piper_model = ""
+pace = 1.0
+volume_db = 0.0
+
+[stream]
+mode = "chunk"
+normalize_dbfs = -16
+
+[voice_changer]
+enabled = true
+base_url = "http://localhost:18000"
+endpoint = "/api/voice-changer/convert_chunk"
+input_sample_rate = 0
+output_sample_rate = 0
+timeout_sec = 5.0
+save_original_path = "cache/tts_original.wav"
+save_converted_path = "cache/tts_converted.wav"
+fallback_endpoint = "/api/voice-changer/convert_chunk_bulk"
+fallback_output_device = ""
+stream_mode = false
+stream_chunk_ms = 1000
+
+[logging]
+level = "INFO"

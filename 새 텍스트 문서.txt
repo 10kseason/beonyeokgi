@@ -1,0 +1,379 @@
+좋아, 메뉴얼 한 번에 던져준다. 코덱스가 이대로 만들면 굴러간다. 잡소리 빼고 기술 문서 톤으로 적는다.
+
+# 실시간 KOR→ENG TTS 송출 파이프라인 매뉴얼 (봇 없이, 디스코드 보이스 채널)
+
+## 0) 개요
+
+입력 마이크(한국어) → Whisper(전사/번역) → TTS(영어 발화) → \[옵션] RVC(보이스 변환) → VB-CABLE 라우팅 → 디스코드 마이크 입력.
+목표: 내 목소리 사용 없이 기본 제공 음성으로 자연스러운 영어 발화 송출.
+
+---
+
+## 1) 시스템 요구사항
+
+* OS: Windows 10/11 64bit
+* GPU: RTX 4060 16GB (충분)
+* Python: 3.10–3.12
+* 오디오 라우팅: **VB-CABLE** 필수, \[옵션] Voicemeeter
+* 마이크 1개
+
+---
+
+## 2) 설치
+
+### 2.1 파이썬 패키지
+
+```bash
+python -m venv .venv
+.\.venv\Scripts\activate
+pip install --upgrade pip wheel
+
+# ASR + 전처리
+pip install faster-whisper webrtcvad-wheels sounddevice pydub numpy
+
+# TTS (온라인) 또는 (오프라인) 둘 중 하나
+pip install edge-tts                         # 온라인 MS TTS
+# 또는
+pip install piper-tts                        # 오프라인 Piper
+
+# 유틸
+pip install tomli tomli-w
+```
+
+> GPU 가속 강제: 환경변수 `CT2_FORCE_GPU=1` 또는 코드에서 `device="cuda", compute_type="float16"` 사용.
+
+### 2.2 오디오 라우팅
+
+* **VB-CABLE** 설치 후 재부팅
+* 디스코드 설정 → 음성/영상
+
+  * 입력 장치: **CABLE Output (VB-Audio Virtual Cable)**
+  * 소음 억제/에코 제거/자동 이득/고급 음성 처리: 모두 **끔**
+  * 입력 감도: 수동, 살짝 낮게
+* 기본 재생 장치(또는 플레이어 출력): **CABLE Input**
+
+\[옵션] Voicemeeter 사용 시
+
+* TTS를 `Voicemeeter VAIO`로, 최종 출력 `B1(=Voicemeeter Output)`을 디스코드 마이크로 지정
+* 득커(Ducker)로 TTS 순간에 BGM 자동 감쇄 가능
+
+---
+
+## 3) 폴더 구조
+
+```
+realtime-kr2en/
+├─ README.md
+├─ requirements.txt
+├─ config/
+│  └─ settings.toml
+├─ models/                 # Whisper 모델 캐시(자동 다운로드)
+├─ src/
+│  ├─ main.py              # 엔트리포인트
+│  ├─ audio_io.py          # 마이크 캡처/재생, 라우팅
+│  ├─ vad.py               # 웹RTC VAD, 문장 단위 세그멘터
+│  ├─ asr.py               # faster-whisper 래퍼(전사/번역)
+│  ├─ tts_edge.py          # Edge TTS 래퍼(온라인)
+│  ├─ tts_piper.py         # Piper 래퍼(오프라인)
+│  ├─ router.py            # 파이프라인 오케스트레이션
+│  └─ utils.py             # 로그, 타이밍, 레이트 변환 등
+└─ run.bat
+```
+
+---
+
+## 4) 설정 파일 예시 `config/settings.toml`
+
+```toml
+[device]
+input_samplerate = 16000
+output_samplerate = 48000
+# Windows 장치 고유명. 기본값은 시스템 기본 장치 사용.
+input_device = ""     # 빈 값이면 기본 마이크
+output_device = ""    # 빈 값이면 기본 재생 장치(CABLE Input으로 수동 지정 권장)
+
+[asr]
+whisper_model = "small"          # base / small / medium 권장
+device = "cuda"
+compute_type = "float16"
+task = "translate"               # translate = KOR→ENG 즉시 번역
+language = "ko"
+beam_size = 1
+vad = true
+
+[vad]
+frame_ms = 30
+aggressiveness = 2               # 0~3, 높을수록 민감
+min_speech_sec = 0.30
+max_utterance_sec = 8.0
+silence_end_ms = 300             # 침묵 감지로 세그먼트 종료
+
+[tts]
+engine = "edge"                  # edge | piper
+voice = "en-US-AriaNeural"       # edge-tts 보이스명
+piper_model = ""                 # piper 사용 시 .onnx 또는 .onnx.tar 경로
+pace = 1.0
+volume_db = 0.0
+
+[stream]
+mode = "chunk"                   # chunk | stream (구현 기본: chunk)
+normalize_dbfs = -16
+```
+
+---
+
+## 5) 실행 흐름
+
+1. **마이크 캡처**: 16 kHz mono int16 프레임 수집
+2. **VAD 세그멘테이션**: 발화 구간만 추출, 문장 단위로 끊음
+3. **ASR/번역**: Whisper `task=translate`로 ENG 텍스트 획득
+4. **TTS 합성**: Edge-TTS 또는 Piper로 WAV 버퍼 생성
+5. **재생/라우팅**: 48 kHz WAV을 시스템 출력으로 재생 → VB-CABLE 통해 디스코드로 입력
+
+---
+
+## 6) 핵심 코드 스켈레톤
+
+### 6.1 `src/vad.py`
+
+```python
+import webrtcvad
+
+class VADSegmenter:
+    def __init__(self, sr=16000, frame_ms=30, aggressiveness=2,
+                 min_speech_sec=0.30, max_utt_sec=8.0, silence_end_ms=300):
+        self.sr = sr; self.frame_ms = frame_ms; self.aggr = aggressiveness
+        self.min_speech = int(min_speech_sec * sr * 2)
+        self.max_bytes = int(max_utt_sec * sr * 2)
+        self.sil_end_frames = int(silence_end_ms // frame_ms)
+        self.vad = webrtcvad.Vad(self.aggr)
+        self._reset()
+
+    def _reset(self):
+        self.buf = bytearray(); self.sil_frames = 0; self.speaking = False
+
+    def push(self, chunk_bytes: bytes):
+        # chunk_bytes: int16 mono raw
+        frame_len = int(self.sr * self.frame_ms / 1000) * 2
+        out = None
+        for i in range(0, len(chunk_bytes), frame_len):
+            f = chunk_bytes[i:i+frame_len]
+            if len(f) < frame_len: break
+            is_speech = self.vad.is_speech(f, self.sr)
+            if is_speech:
+                self.speaking = True; self.sil_frames = 0
+                self.buf.extend(f)
+                if len(self.buf) >= self.max_bytes:
+                    out = bytes(self.buf); self._reset()
+            else:
+                if self.speaking:
+                    self.sil_frames += 1
+                    if self.sil_frames >= self.sil_end_frames and len(self.buf) >= self.min_speech:
+                        out = bytes(self.buf); self._reset()
+        return out
+```
+
+### 6.2 `src/asr.py`
+
+```python
+from faster_whisper import WhisperModel
+import numpy as np
+
+class ASR:
+    def __init__(self, model="small", device="cuda", compute_type="float16",
+                 task="translate", language="ko", beam_size=1):
+        self.model = WhisperModel(model, device=device, compute_type=compute_type)
+        self.task = task; self.language = language; self.beam_size = beam_size
+
+    def transcribe_translate(self, pcm16: bytes, sr=16000) -> str:
+        # int16 -> float32
+        x = np.frombuffer(pcm16, dtype=np.int16).astype("float32") / 32768.0
+        segs, _ = self.model.transcribe(x, language=self.language, task=self.task,
+                                        beam_size=self.beam_size, vad_filter=True)
+        return " ".join(s.text.strip() for s in segs).strip()
+```
+
+### 6.3 `src/tts_edge.py`
+
+```python
+import asyncio, edge_tts, tempfile, sounddevice as sd, numpy as np
+from pydub import AudioSegment
+
+class EdgeTTS:
+    def __init__(self, voice="en-US-AriaNeural", pace=1.0, volume_db=0.0, out_sr=48000):
+        self.voice = voice; self.pace = pace; self.volume_db = volume_db; self.out_sr = out_sr
+
+    async def synth_to_play(self, text: str):
+        if not text: return
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            out = f.name
+        com = edge_tts.Communicate(text, self.voice, rate=f"{(self.pace-1)*100:+.0f}%")
+        await com.save(out)
+        seg = AudioSegment.from_wav(out) + self.volume_db
+        seg = seg.set_frame_rate(self.out_sr).set_channels(1)
+        y = np.array(seg.get_array_of_samples()).astype("float32")/32768.0
+        sd.play(y, self.out_sr); sd.wait()
+```
+
+### 6.4 `src/tts_piper.py`
+
+```python
+import sounddevice as sd, numpy as np
+from piper import PiperVoice
+
+class PiperTTS:
+    def __init__(self, model_path:str, out_sr=48000, pace=1.0, volume_db=0.0):
+        self.voice = PiperVoice.load(model_path)
+        self.out_sr = out_sr; self.pace = pace; self.volume_gain = volume_db
+
+    def synth_to_play(self, text:str):
+        if not text: return
+        wav, sr = self.voice.synthesize(text, length_scale=self.pace)
+        if self.volume_gain != 0.0:
+            wav *= 10**(self.volume_gain/20)
+        sd.play(wav.astype("float32"), sr); sd.wait()
+```
+
+### 6.5 `src/audio_io.py` (마이크 캡처 루프)
+
+```python
+import sounddevice as sd, queue
+
+class MicReader:
+    def __init__(self, sr=16000, block_ms=30, device=None):
+        self.sr = sr; self.block = int(sr*block_ms/1000); self.device = device
+        self.q = queue.Queue()
+
+    def start(self):
+        self.stream = sd.RawInputStream(samplerate=self.sr, blocksize=self.block,
+                                        dtype="int16", channels=1,
+                                        device=self.device, callback=self._cb)
+        self.stream.start()
+
+    def _cb(self, indata, frames, t, status):
+        self.q.put(bytes(indata))
+
+    def read(self):
+        return self.q.get()
+
+    def stop(self):
+        self.stream.stop(); self.stream.close()
+```
+
+### 6.6 `src/main.py` (엔트리포인트)
+
+```python
+import asyncio, tomli
+from src.audio_io import MicReader
+from src.vad import VADSegmenter
+from src.asr import ASR
+from src.tts_edge import EdgeTTS
+from src.tts_piper import PiperTTS
+
+def load_cfg(path="config/settings.toml"):
+    with open(path, "rb") as f: return tomli.load(f)
+
+async def run():
+    cfg = load_cfg()
+    # 1) IO
+    mic = MicReader(sr=cfg["device"]["input_samplerate"], block_ms=cfg["vad"]["frame_ms"])
+    vad = VADSegmenter(sr=cfg["device"]["input_samplerate"],
+                       frame_ms=cfg["vad"]["frame_ms"],
+                       aggressiveness=cfg["vad"]["aggressiveness"],
+                       min_speech_sec=cfg["vad"]["min_speech_sec"],
+                       max_utt_sec=cfg["vad"]["max_utterance_sec"],
+                       silence_end_ms=cfg["vad"]["silence_end_ms"])
+    # 2) ASR
+    asr = ASR(model=cfg["asr"]["whisper_model"],
+              device=cfg["asr"]["device"],
+              compute_type=cfg["asr"]["compute_type"],
+              task=cfg["asr"]["task"],
+              language=cfg["asr"]["language"],
+              beam_size=cfg["asr"]["beam_size"])
+    # 3) TTS
+    if cfg["tts"]["engine"] == "edge":
+        tts = EdgeTTS(voice=cfg["tts"]["voice"], pace=cfg["tts"]["pace"],
+                      volume_db=cfg["tts"]["volume_db"], out_sr=cfg["device"]["output_samplerate"])
+        speak = lambda txt: asyncio.create_task(tts.synth_to_play(txt))
+    else:
+        tts = PiperTTS(model_path=cfg["tts"]["piper_model"], out_sr=cfg["device"]["output_samplerate"],
+                       pace=cfg["tts"]["pace"], volume_db=cfg["tts"]["volume_db"])
+        async def speak_piper(txt): tts.synth_to_play(txt)
+        speak = speak_piper
+
+    print("KOR→ENG 실시간 읽기 시작. 디스코드 보이스 채널에서 테스트하세요. Ctrl+C 종료")
+    mic.start()
+    try:
+        while True:
+            chunk = mic.read()
+            seg = vad.push(chunk)
+            if seg is None: continue
+            text_en = asr.transcribe_translate(seg)
+            if text_en:
+                print(">>", text_en)
+                await speak(text_en)
+    finally:
+        mic.stop()
+
+if __name__ == "__main__":
+    asyncio.run(run())
+```
+
+---
+
+## 7) RVC 옵션 단계 (원할 때만)
+
+* 위 `main.py`에서 `speak()` 단계 대신:
+
+  1. TTS WAV를 파일/파이프 출력
+  2. RVC WebUI 실시간 입력 장치를 **CABLE Output**으로
+  3. RVC 출력 장치를 **CABLE Input** 또는 Voicemeeter VAIO로
+* 사실 클로닝을 안 쓰겠다면 RVC는 생략 권장. 이펙트 성격에 가깝고 지연만 늘어난다.
+
+---
+
+## 8) 성능/지연 튜닝
+
+* Whisper 모델: `small`→`medium` 순으로 품질↑ 지연↑. 4060 16GB면 `small` 실시간 여유, `medium`도 가능.
+* `vad.frame_ms`: 20\~30 ms, `silence_end_ms`: 200\~300 ms 권장
+* Chunk 길이: 한 문장 2\~6초. 장문은 끊어라.
+* 디스코드: 48 kHz 모노. 자동 보정류 전부 OFF.
+* Edge-TTS는 합성 후 재생식이라 지연이 “문장 단위”로 나타난다. 대화감 좋게 하려면 문장을 짧게.
+
+---
+
+## 9) 테스트 절차(수락 기준)
+
+1. 디스코드 비공개 보이스 채널 접속, 입력: **CABLE Output**
+2. 콘솔 실행 후 한국어로 한 문장 말하기: “오늘 일정은 두 개야.”
+3. 콘솔 출력에 영어 문장 표시되고, 보이스 채널에서 영어 음성이 자연스럽게 들리면 PASS
+4. 10회 반복 시 음절 누락/말 중 끊김 ≤ 1회
+5. 백그라운드 음악 20% 볼륨에서 TTS 명료도 95% 이상 유지
+
+---
+
+## 10) 장애 대응
+
+* **음성 끊김**: 디스코드 소음 억제/에코/AGC 꺼져 있는지 확인. 입력 감도 수동으로 낮춰라.
+* **레이트 틀어짐**: 출력 48 kHz 고정. 플레이어가 44.1로 뿜으면 늘어진다.
+* **ASR 오번역**: `asr.task="transcribe"`로 원문 추출 후 로컬 LLM 번역 단계 추가.
+* **무반응**: 마이크 권한, 장치 이름, 가상 케이블 설치 확인.
+
+---
+
+## 11) 라이선스·주의
+
+* 기본 제공 TTS 음성 사용은 클로닝 아님. 플랫폼 약관 범위 내.
+* 제3자 음원/저작물 송출은 권리 확인 후 사용. 퍼블릭 채널에서 특히.
+
+---
+
+## 12) 실행 스크립트 `run.bat`
+
+```bat
+@echo off
+call .\.venv\Scripts\activate
+python -m src.main
+```
+
+끝. 이대로 코덱스에 던지면 구현 가능하다. 실패하면 세팅이 문제지 설계가 문제는 아니다.

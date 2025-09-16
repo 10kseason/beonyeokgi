@@ -1,0 +1,6 @@
+*** Begin Patch
+*** Update File: src/main.py
+@@
+-    print("KOR??ENG ??시??변????작. ??스코드 보이??채널??서 ??스??하??요. Ctrl+C 종료")
++    print('Starting real-time KO->EN translation. Ctrl+C to stop.')
+*** End Patch
