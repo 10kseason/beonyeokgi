@@ -1,23 +1,29 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Dict, Optional, Tuple
 
 import torch
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
 
+LANGUAGE_MODELS: Dict[str, str] = {
+    "ko": "Helsinki-NLP/opus-mt-ko-en",
+    "ja": "Helsinki-NLP/opus-mt-ja-en",
+    "zh": "Helsinki-NLP/opus-mt-zh-en",
+}
+
+
 @dataclass
 class TranslatorConfig:
-    model_name: str = "Helsinki-NLP/opus-mt-ko-en"
+    model_name: str
     device: Optional[str] = None
 
 
-class KoEnTranslator:
-    """Translate Korean text to English using a small seq2seq model."""
+class Seq2SeqTranslator:
+    """Lazy wrapper around Hugging Face seq2seq translation models."""
 
-    def __init__(self, model_name: str | None = None, device: str | None = None) -> None:
-        model_name = model_name or TranslatorConfig.model_name
+    def __init__(self, model_name: str, device: str | None = None) -> None:
         self.cfg = TranslatorConfig(model_name=model_name, device=device)
         self._tokenizer = AutoTokenizer.from_pretrained(model_name)
         self._model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
@@ -40,3 +46,28 @@ class KoEnTranslator:
             generated = self._model.generate(**inputs, max_length=512, num_beams=4)
         output = self._tokenizer.decode(generated[0], skip_special_tokens=True)
         return output.strip()
+
+
+_TRANSLATOR_CACHE: Dict[Tuple[str, Optional[str]], Seq2SeqTranslator] = {}
+
+
+def get_translator(language: str, device: str | None = None) -> Optional[Seq2SeqTranslator]:
+    """Return a cached translator for the requested language, if available."""
+
+    normalized = (language or "").split("-")[0].lower()
+    model_name = LANGUAGE_MODELS.get(normalized)
+    if not model_name:
+        return None
+    cache_key = (normalized, device)
+    translator = _TRANSLATOR_CACHE.get(cache_key)
+    if translator is None:
+        translator = Seq2SeqTranslator(model_name=model_name, device=device)
+        _TRANSLATOR_CACHE[cache_key] = translator
+    return translator
+
+
+class KoEnTranslator(Seq2SeqTranslator):
+    """Backwards-compatible wrapper for the Korean → English translator."""
+
+    def __init__(self, model_name: str | None = None, device: str | None = None) -> None:
+        super().__init__(model_name or LANGUAGE_MODELS["ko"], device=device)

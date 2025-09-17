@@ -210,18 +210,32 @@ def describe_device(device: Optional[object]) -> str:
     return str(parsed)
 
 
+def describe_optional_device(device: Optional[object], empty_label: str = "사용 안 함") -> str:
+    if device in (None, "", "default"):
+        return empty_label
+    return describe_device(device)
+
+
 def _save_devices_local(
     cfg_path: str,
     input_dev: Optional[object],
     output_dev: Optional[object],
+    kokoro_dev: Optional[object],
 ) -> None:
     base_dir = os.path.dirname(cfg_path)
     local_path = os.path.join(base_dir, "local.toml")
-    data: Dict[str, Dict[str, Any]] = {"device": {}}
+    data: Dict[str, Dict[str, Any]] = {}
+    device_section: Dict[str, Any] = {}
     if input_dev is not None:
-        data["device"]["input_device"] = parse_sd_device(input_dev)
+        device_section["input_device"] = parse_sd_device(input_dev)
     if output_dev is not None:
-        data["device"]["output_device"] = parse_sd_device(output_dev)
+        device_section["output_device"] = parse_sd_device(output_dev)
+    if device_section:
+        data["device"] = device_section
+    if kokoro_dev is not None:
+        data.setdefault("kokoro", {})["passthrough_input_device"] = parse_sd_device(kokoro_dev)
+    if not data:
+        return
     try:
         os.makedirs(base_dir, exist_ok=True)
         with open(local_path, "wb") as fh:
@@ -298,9 +312,10 @@ def run_app(cfg_path: str, args: Optional[argparse.Namespace]) -> None:
     device_cfg = cfg.setdefault("device", {})
     asr_cfg = cfg.setdefault("asr", {})
     app_cfg = cfg.setdefault("app", {})
+    kokoro_cfg = cfg.setdefault("kokoro", {})
 
     language = asr_cfg.get("language", "ko")
-    supported_languages = {code for code, _ in LANGUAGE_OPTIONS}
+    supported_languages = {option.code for option in LANGUAGE_OPTIONS}
     if language not in supported_languages:
         language = "ko"
         asr_cfg["language"] = language
@@ -312,6 +327,7 @@ def run_app(cfg_path: str, args: Optional[argparse.Namespace]) -> None:
 
     input_device = device_cfg.get("input_device")
     output_device = device_cfg.get("output_device")
+    kokoro_passthrough = kokoro_cfg.get("passthrough_input_device")
 
     if input_device in (None, ""):
         chosen = select_input_device_gui()
@@ -331,13 +347,26 @@ def run_app(cfg_path: str, args: Optional[argparse.Namespace]) -> None:
 
     input_label = describe_device(input_device)
     output_label = describe_device(output_device)
-    _save_devices_local(cfg_path, input_device, output_device)
+    kokoro_label = describe_optional_device(kokoro_passthrough)
+    kokoro_save = kokoro_passthrough if kokoro_passthrough not in ("",) else None
+    _save_devices_local(cfg_path, input_device, output_device, kokoro_save)
 
-    state = SharedState(language, preset_key, input_device, output_device, input_label, output_label)
-    state.set_labels(input_label, output_label)
+    state = SharedState(
+        language,
+        preset_key,
+        input_device,
+        output_device,
+        input_label,
+        output_label,
+        kokoro_passthrough,
+        kokoro_label,
+    )
+    state.set_labels(input_label, output_label, kokoro_label)
 
-    def save_devices_callback(inp: Optional[object], out: Optional[object]) -> None:
-        _save_devices_local(cfg_path, inp, out)
+    def save_devices_callback(
+        inp: Optional[object], out: Optional[object], kokoro: Optional[object]
+    ) -> None:
+        _save_devices_local(cfg_path, inp, out, kokoro)
 
     pipeline = TranslatorPipeline(cfg, state, save_devices_callback)
 
@@ -353,10 +382,21 @@ def run_app(cfg_path: str, args: Optional[argparse.Namespace]) -> None:
             return
         state.request_output_device(selected, describe_device(selected))
 
+    def on_change_kokoro() -> None:
+        selected = select_output_device_gui(
+            current=state.get_active_kokoro_device(),
+            title="Select Kokoro Output Mirror",
+            prompt="Choose the device that should receive Kokoro TTS audio:",
+        )
+        if selected is None:
+            return
+        label = describe_device(selected)
+        state.request_kokoro_device(selected, label)
+
     def on_close() -> None:
         pipeline.stop()
 
-    ui = TranslatorUI(state, on_change_input, on_change_output, on_close)
+    ui = TranslatorUI(state, on_change_input, on_change_output, on_change_kokoro, on_close)
     pipeline.start()
     try:
         ui.run()
@@ -371,7 +411,11 @@ def _build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--list-voices", action="store_true", help="List Edge TTS voices (network) and exit")
     parser.add_argument("--input-device", help="Input device index or name")
     parser.add_argument("--output-device", help="Output device index or name")
-    parser.add_argument("--language", choices=[code for code, _ in LANGUAGE_OPTIONS], help="Force input language")
+    parser.add_argument(
+        "--language",
+        choices=[option.code for option in LANGUAGE_OPTIONS],
+        help="Force input language",
+    )
     parser.add_argument("--preset", choices=list(PRESETS.keys()), help="Select processing preset")
     return parser
 

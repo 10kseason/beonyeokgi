@@ -2,7 +2,7 @@ Realtime Speech Translator (Windows)
 
 - Real-time mic capture → VAD chunking → Whisper translate (ko/ja/zh → en) → Kokoro 82M TTS playback.
 - Deterministic 16 kHz preprocessing (loudness normalization, 90 Hz high-pass, 7.2 kHz low-pass) and filler removal for Korean (음/어/그니까).
-- Single-page desktop UI showing active devices, language lock, latency gauge, and preset selector.
+- Single-page desktop UI showing mic/output/Kokoro routing, fixed language pairs (ko/ja/zh → EN), a latency gauge, and preset selector.
 - Optimized for Windows + VB-CABLE to feed TTS into a Discord voice channel.
 
 Quickstart
@@ -13,18 +13,20 @@ Quickstart
 
 Setup
 
-1) Create venv and install deps:
-   - `python -m venv .venv`
-   - `.\.venv\Scripts\activate`
-   - `pip install --upgrade pip wheel`
-   - `pip install -r requirements.txt`
-   - `pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu`  # needed for text translator
+1) Bootstrap the virtual environment (runs safely multiple times):
+   - Double-click `for_vene.bat` or run it from `cmd`. The script creates/updates `.venv`, upgrades `pip/setuptools/wheel`, and installs everything from `requirements.txt` (CPU PyTorch by default).
+   - GPU users can edit the `--extra-index-url` line in `requirements.txt` before running the script to target a CUDA/ROCm build from the official PyTorch index.
 2) Audio routing (VB-CABLE):
    - Set default playback to `CABLE Input` (or route with Voicemeeter)
    - In Discord, set Input device to `CABLE Output`
    - Disable echo cancellation / noise suppression / AGC in Discord
 3) Optional: install ffmpeg if you plan to use pydub-based features (voice changer previews, etc.):
    - Download ffmpeg and add its `bin` to PATH
+
+Kokoro backend
+--------------
+
+- Install the official Kokoro runtime packages (PyTorch and/or ONNX variants) after the base environment is ready. Follow the Kokoro repository instructions for the backend you intend to use.
 
 Config
 
@@ -65,7 +67,8 @@ Kokoro 82M GPU TTS
 - Mirror Kokoro playback to a virtual microphone by setting `[kokoro].passthrough_input_device` to the input device index/name (e.g. the 3rd input device). Audio continues to play on the main output while also feeding the specified input.
 - To pin a specific configuration, override `[kokoro].backend`, `[kokoro].device`, or `[kokoro].onnx_providers` and rerun. CLI overrides such as `--kokoro-backend onnx` or `--kokoro-provider DmlExecutionProvider` are still supported.
 - Built-in queueing keeps playback smooth: sentences are batched until the group reaches roughly 0.8–1.2 s, a fixed 120 ms crossfade blends consecutive utterances, and short clips flush automatically when speech pauses. The tunables (`short_threshold_ms`, `min_batch_ms`, `max_batch_ms`, `crossfade_ms`, etc.) live under `[kokoro]` if you need to tweak them.
-- Kokoro playback is skipped automatically if Whisper returns Korean (non-translated) text, preventing Korean sentences from being spoken in the English voice.
+- Kokoro playback is skipped automatically if translation fails and non-English (Hangul/Kana/Han) characters remain after the fallback translator pass.
+- `[kokoro].passthrough_input_device` can now be set directly from the UI ("Kokoro 출력" row) instead of editing the config file.
 
 Voice Changer Integration
 
@@ -77,7 +80,7 @@ Voice Changer Integration
 
 Notes
 
-- Ko?En translation now uses Helsinki-NLP/opus-mt-ko-en via transformers/torch. If those packages are missing, Whisper Turbo will fall back to raw Korean text.
+- Translation to English is enforced for the supported input languages (ko/ja/zh). Whisper handles the primary translation and, if residual CJK text remains, the app falls back to the Helsinki-NLP ko/ja/zh → en models before speaking.
 - If audio plays too loud/quiet, tune `[tts].volume_db` and `[stream].normalize_dbfs`.
 - Set `[logging].level = "DEBUG"` to enable per-segment ASR/TTS timing logs while tuning performance.
 - For CPU-only, set `[asr].device = "cpu"` and `compute_type = "int8"` or `"int8_float16"`.
