@@ -1,5 +1,6 @@
 import asyncio
 import argparse
+import logging
 import os
 import sys
 import time
@@ -17,6 +18,9 @@ from .tts_edge import EdgeTTS
 from .tts_piper import PiperTTS
 from .voice_changer_client import VoiceChangerClient, VoiceChangerConfig
 from .utils import parse_sd_device
+
+
+logger = logging.getLogger("vc-translator.main")
 
 
 def _deep_merge(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
