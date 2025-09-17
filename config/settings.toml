@@ -37,6 +37,7 @@ use_half = true
 onnx_model = ""
 onnx_providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
 execution_provider = ""
+passthrough_input_device = ""  # Optional: mirror Kokoro audio to another device (e.g., virtual mic)
 short_threshold_ms = 500.0
 min_batch_ms = 900.0
 max_batch_ms = 1200.0

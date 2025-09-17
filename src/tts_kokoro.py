@@ -43,6 +43,7 @@ class KokoroConfig:
     volume_db: float = 0.0
     out_sr: int = 48000
     output_device: Optional[str] = None
+    passthrough_input_device: Optional[object] = None
     short_threshold_ms: float = 500.0
     min_batch_ms: float = 900.0
     max_batch_ms: float = 1200.0
@@ -123,6 +124,7 @@ class KokoroTTS:
         volume_db: float = 0.0,
         out_sr: int = 48000,
         output_device: Optional[str] = None,
+        passthrough_input_device: Optional[object] = None,
         voice_changer: Optional["VoiceChangerClient"] = None,
         short_threshold_ms: float = 500.0,
         min_batch_ms: float = 900.0,
@@ -152,6 +154,7 @@ class KokoroTTS:
             volume_db=volume_db,
             out_sr=out_sr,
             output_device=output_device,
+            passthrough_input_device=passthrough_input_device,
             short_threshold_ms=float(short_threshold_ms),
             min_batch_ms=float(min_batch_ms),
             max_batch_ms=float(max_batch_ms),
@@ -189,6 +192,11 @@ class KokoroTTS:
         self._tail_flush_delay = self.cfg.tail_flush_ms / 1000.0
         self._short_idle_threshold = self.cfg.short_idle_flush_ms / 1000.0
         self._probe_text = DEFAULT_PROBE_TEXT
+
+        self.cfg.output_device = self._normalize_device(self.cfg.output_device)
+        self.cfg.passthrough_input_device = self._normalize_device(
+            self.cfg.passthrough_input_device
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -329,13 +337,21 @@ class KokoroTTS:
 
         if self.voice_changer is not None and vc_success is False:
             if fallback_device:
-                self._write_audio(base_audio, sample_rate, device=fallback_device)
+                self._play_audio_to_targets(
+                    base_audio,
+                    sample_rate,
+                    primary_device=fallback_device,
+                    include_default=False,
+                )
                 self._handle_latency(synth_elapsed)
                 return False
             playback_audio = base_audio
             playback_sr = sample_rate
 
-        self._write_audio(playback_audio.astype(np.float32, copy=False), playback_sr)
+        self._play_audio_to_targets(
+            playback_audio.astype(np.float32, copy=False),
+            playback_sr,
+        )
         self._handle_latency(synth_elapsed)
         return vc_success
 
@@ -353,6 +369,17 @@ class KokoroTTS:
         if self._latency_anomaly_count >= 3:
             if self._switch_to_next_plan():
                 self._latency_anomaly_count = 0
+
+    @staticmethod
+    def _normalize_device(device: Optional[object]) -> Optional[object]:
+        if device is None:
+            return None
+        if isinstance(device, str):
+            stripped = device.strip()
+            if not stripped:
+                return None
+            return stripped
+        return device
 
     def _device_key(self, device: Optional[object]) -> str:
         parsed = parse_sd_device(device if device is not None else self.cfg.output_device)
@@ -387,6 +414,36 @@ class KokoroTTS:
                 raise RuntimeError(f"Failed to open Kokoro output stream: {exc}")
             state.samplerate = sample_rate
             state.tail = np.zeros(0, dtype=np.float32)
+
+    def _play_audio_to_targets(
+        self,
+        audio: np.ndarray,
+        sample_rate: int,
+        primary_device: Optional[object] = None,
+        include_default: bool = True,
+    ) -> None:
+        if audio.size == 0 or sample_rate <= 0:
+            return
+        targets: List[Optional[object]] = []
+        normalized_primary = self._normalize_device(primary_device)
+        if normalized_primary is not None:
+            targets.append(normalized_primary)
+        if include_default:
+            normalized_default = self._normalize_device(self.cfg.output_device)
+            targets.append(normalized_default)
+        normalized_passthrough = self._normalize_device(self.cfg.passthrough_input_device)
+        if normalized_passthrough is not None:
+            targets.append(normalized_passthrough)
+
+        seen: set[str] = set()
+        for target in targets:
+            if target is None and not include_default and normalized_primary is None:
+                continue
+            key = self._device_key(target)
+            if key in seen:
+                continue
+            seen.add(key)
+            self._write_audio(audio, sample_rate, device=target)
 
     def _write_audio(self, audio: np.ndarray, sample_rate: int, device: Optional[object] = None) -> None:
         if audio.size == 0 or sample_rate <= 0:
@@ -445,7 +502,7 @@ class KokoroTTS:
         """Update the playback device and reset active streams."""
 
         with self._play_lock:
-            self.cfg.output_device = device
+            self.cfg.output_device = self._normalize_device(device)
             for state in self._play_states.values():
                 if state.timer is not None:
                     state.timer.cancel()
