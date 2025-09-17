@@ -70,6 +70,7 @@ Kokoro 82M GPU TTS
 - Built-in queueing keeps playback smooth: sentences are batched until the group reaches roughly 0.8–1.2 s, a fixed 120 ms crossfade blends consecutive utterances, and short clips flush automatically when speech pauses. The tunables (`short_threshold_ms`, `min_batch_ms`, `max_batch_ms`, `crossfade_ms`, etc.) live under `[kokoro]` if you need to tweak them.
 - Kokoro playback is skipped automatically if translation fails and non-English (Hangul/Kana/Han) characters remain after the fallback translator pass.
 - `[kokoro].passthrough_input_device` can now be set directly from the UI ("Kokoro 출력" row) instead of editing the config file.
+- Optional subtitle streaming pushes each translated sentence to an HTTP endpoint so Kokoro overlays can show live English captions.
 
 Voice Changer Integration
 
@@ -83,6 +84,7 @@ Notes
 
 - Translation to English is enforced for the supported input languages (ko/ja/zh). Whisper handles the primary translation and, if residual CJK text remains, the app falls back to the Helsinki-NLP ko/ja/zh → en models before speaking.
 - If audio plays too loud/quiet, tune `[tts].volume_db` and `[stream].normalize_dbfs`.
+- Subtitle stream payloads follow `{text, sequence, timestamp_ms, duration_ms, source_language, target_language}` and are enabled with `[kokoro_subtitles]` in `config/settings.toml`.
 - Set `[logging].level = "DEBUG"` to enable per-segment ASR/TTS timing logs while tuning performance.
 - For CPU-only, set `[asr].device = "cpu"` and `compute_type = "int8"` or `"int8_float16"`.
 - For Piper TTS, set `[tts].engine = "piper"` and provide `[tts].piper_model` path to a `.onnx` or `.tar` bundle, then install Piper models separately.

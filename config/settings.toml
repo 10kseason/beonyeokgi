@@ -48,6 +48,16 @@ tail_flush_ms = 350.0
 short_idle_flush_ms = 650.0
 warmup_runs = 2
 
+[kokoro_subtitles]
+enabled = false
+endpoint = ""  # e.g. http://localhost:8080/api/subtitles
+method = "POST"
+timeout_sec = 2.0
+include_timestamps = true
+retry_limit = 1
+retry_backoff_sec = 0.5
+headers = {}  # Optional HTTP headers (e.g. { Authorization = "Bearer ..." })
+
 [app]
 preset = "latency"
 

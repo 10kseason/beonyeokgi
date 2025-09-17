@@ -12,8 +12,9 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from .audio_io import MicReader
 from .asr import ASR
+from .kokoro_subtitles import KokoroSubtitleStreamer, SubtitleStreamConfig
 from .preprocess import AudioPreprocessor
-from .tts_kokoro import KokoroTTS
+from .tts_kokoro import KokoroTTS, MissingKokoroModelError
 from .utils import contains_cjk, parse_sd_device
 from .vad import VADSegmenter
 from .voice_changer_client import VoiceChangerClient, VoiceChangerConfig
@@ -102,6 +103,7 @@ class SharedState:
         self._kokoro_label = kokoro_label or ""
         self._generation = 0
         self.latency_ms = 0.0
+        self._alerts: List[str] = []
 
     # ------------------------------------------------------------------
     # Requests from UI thread
@@ -196,6 +198,19 @@ class SharedState:
         with self._lock:
             self.latency_ms = float(max(0.0, latency_ms))
 
+    def push_alert(self, message: str) -> None:
+        cleaned = message.strip()
+        if not cleaned:
+            return
+        with self._lock:
+            self._alerts.append(message)
+
+    def pop_alert(self) -> Optional[str]:
+        with self._lock:
+            if not self._alerts:
+                return None
+            return self._alerts.pop(0)
+
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
             return {
@@ -260,6 +275,8 @@ class TranslatorPipeline:
         self._current_kokoro_device = state.get_active_kokoro_device()
         self._translator_cache: Dict[str, Optional[Any]] = {}
         self._language_targets = {option.code: option.target for option in LANGUAGE_OPTIONS}
+        self._kokoro_missing_notified = False
+        self._subtitle_streamer: Optional[KokoroSubtitleStreamer] = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -309,6 +326,9 @@ class TranslatorPipeline:
 
         preset_key = self.state.get_active_preset()
         preset = PRESETS.get(preset_key, PRESETS["latency"])
+
+        subtitle_cfg = self.cfg.get("kokoro_subtitles", {}) or {}
+        self._subtitle_streamer = self._init_subtitle_streamer(subtitle_cfg)
 
         mic = MicReader(
             sr=input_sr,
@@ -400,6 +420,12 @@ class TranslatorPipeline:
             except Exception:
                 logger.debug("Failed to flush TTS on shutdown", exc_info=True)
             mic.stop()
+            if self._subtitle_streamer is not None:
+                try:
+                    self._subtitle_streamer.close()
+                except Exception:
+                    logger.debug("Failed to close Kokoro subtitle streamer", exc_info=True)
+                self._subtitle_streamer = None
 
     # ------------------------------------------------------------------
     # Helpers
@@ -450,9 +476,13 @@ class TranslatorPipeline:
             if self._should_skip_non_english(sentence, active_language):
                 logger.info("Skipping TTS because text is not English after translation: %s", sentence)
                 continue
+            self._stream_subtitle(sentence, per_sentence_ms, active_language)
             speak_start = time.perf_counter()
             try:
                 tts.synth_to_play(sentence, src_duration_ms=per_sentence_ms)
+            except MissingKokoroModelError as exc:
+                self._handle_missing_kokoro_model(exc)
+                return
             except Exception:
                 logger.exception("Kokoro playback failed")
                 break
@@ -461,6 +491,14 @@ class TranslatorPipeline:
         self._latency_history.append(total_latency)
         avg_latency = sum(self._latency_history) / len(self._latency_history)
         self.state.update_latency(avg_latency)
+
+    def _handle_missing_kokoro_model(self, exc: MissingKokoroModelError) -> None:
+        if self._kokoro_missing_notified:
+            return
+        self._kokoro_missing_notified = True
+        logger.error("Kokoro model missing: %s", exc)
+        self.state.push_alert(str(exc))
+        self._stop_event.set()
 
     def _normalize_language(self, language: Optional[str]) -> str:
         if not language:
@@ -505,6 +543,52 @@ class TranslatorPipeline:
         if target != "en":
             return False
         return contains_cjk(text)
+
+    def _stream_subtitle(
+        self,
+        text: str,
+        per_sentence_ms: Optional[float],
+        language: Optional[str],
+    ) -> None:
+        streamer = self._subtitle_streamer
+        if streamer is None:
+            return
+        normalized_source = self._normalize_language(language)
+        target_language = self._language_targets.get(normalized_source, "en")
+        try:
+            streamer.submit(
+                text,
+                duration_ms=per_sentence_ms,
+                source_language=normalized_source or None,
+                target_language=target_language,
+            )
+        except Exception:
+            logger.debug("Failed to push Kokoro subtitle", exc_info=True)
+
+    def _init_subtitle_streamer(self, cfg: Dict[str, Any]) -> Optional[KokoroSubtitleStreamer]:
+        if not cfg or not bool(cfg.get("enabled")):
+            return None
+        endpoint = str(cfg.get("endpoint", "")).strip()
+        if not endpoint:
+            return None
+        try:
+            headers_cfg = cfg.get("headers") or {}
+            headers: Dict[str, str] = {}
+            if isinstance(headers_cfg, dict):
+                headers = {str(key): str(value) for key, value in headers_cfg.items()}
+            stream_cfg = SubtitleStreamConfig(
+                endpoint=endpoint,
+                method=str(cfg.get("method", "POST") or "POST"),
+                timeout_sec=float(cfg.get("timeout_sec", 2.0) or 2.0),
+                include_timestamps=bool(cfg.get("include_timestamps", True)),
+                retry_limit=int(cfg.get("retry_limit", 1) or 0),
+                retry_backoff_sec=float(cfg.get("retry_backoff_sec", 0.5) or 0.5),
+                headers=headers,
+            )
+            return KokoroSubtitleStreamer(stream_cfg)
+        except Exception:
+            logger.exception("Failed to initialize Kokoro subtitle streamer")
+            return None
 
     def _apply_configuration(self, vad: VADSegmenter, asr: ASR, tts: KokoroTTS) -> None:
         cfg = self.state.get_configuration()
