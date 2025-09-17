@@ -16,6 +16,7 @@ Setup
 1) Bootstrap the virtual environment (runs safely multiple times):
    - Double-click `for_vene.bat` or run it from `cmd`. The script creates/updates `.venv`, upgrades `pip/setuptools/wheel`, and installs everything from `requirements.txt` (CPU PyTorch by default).
    - GPU users can edit the `--extra-index-url` line in `requirements.txt` before running the script to target a CUDA/ROCm build from the official PyTorch index.
+   - Kokoro PyTorch/ONNX runtimes are now included in `requirements.txt`, so the default TTS backend is ready after this step. Adjust or pin the package versions there if you need specific builds.
 2) Audio routing (VB-CABLE):
    - Set default playback to `CABLE Input` (or route with Voicemeeter)
    - In Discord, set Input device to `CABLE Output`
@@ -26,7 +27,7 @@ Setup
 Kokoro backend
 --------------
 
-- Install the official Kokoro runtime packages (PyTorch and/or ONNX variants) after the base environment is ready. Follow the Kokoro repository instructions for the backend you intend to use.
+- The environment bootstrap installs the official Kokoro runtime packages (PyTorch and ONNX variants) from PyPI. If you prefer a custom build, edit `requirements.txt` before running the setup script or install your desired wheels afterwards.
 
 Config
 

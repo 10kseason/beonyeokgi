@@ -7,6 +7,8 @@ pydub>=0.25.1
 numpy>=1.24
 edge-tts>=6.1.10
 piper-tts>=1.2.0
+kokoro
+kokoro-onnx
 tomli>=2.0.1
 tomli-w>=1.0.0
 transformers>=4.46.0
