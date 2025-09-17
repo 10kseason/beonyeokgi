@@ -29,9 +29,9 @@ Config
 Edit `config/settings.toml` to adjust devices, model size, VAD, and TTS voice.
 Defaults:
 - Input 16 kHz mono; Output 48 kHz
-- Whisper `large-v3-turbo`, `cuda` + `float16` when available
+- Whisper `large-v3-turbo` on CPU (`int8` compute) so the ASR step stays responsive without a GPU
 - VAD 30 ms frames, aggressiveness 2, silence tail 300 ms
-- TTS engine `edge` with `en-US-AriaNeural`
+- TTS engine `edge` with `en-US-AriaNeural`; switch to `kokoro` or `piper` for offline voices
 
 Run
 
@@ -44,13 +44,31 @@ CLI Helpers
 - List audio devices: `python -m src.main --list-devices`
 - List Edge TTS voices: `python -m src.main --list-voices`
 - Override common settings at launch:
-  - `--engine edge|piper`
+  - `--engine edge|piper|kokoro`
   - `--voice en-US-AriaNeural` (Edge)
   - `--piper-model path\to\model.onnx[.tar]`
+  - `--kokoro-model hexgrad/Kokoro-82M`
+  - `--kokoro-speaker af_bella`
+  - `--kokoro-backend auto|pytorch|onnx`
+  - `--kokoro-device auto` / `--kokoro-device cuda` / `--kokoro-device dml` / `--kokoro-device cpu`
+  - `--kokoro-provider CUDAExecutionProvider` (repeat for multiple providers)
   - `--input-device "Your Mic"` or index
   - `--output-device "CABLE Input"` or index
   - `--pace 1.1`  `--volume-db -6`
   - Use `--config` to point at a different TOML file
+
+Kokoro 82M GPU TTS
+------------------
+
+- Set `[tts].engine = "kokoro"` in `config/settings.toml` to route synthesized speech through Kokoro 82M.
+- Backend auto-probing is enabled by default (`[kokoro].backend = "auto"`, `[kokoro].device = "auto"`). At startup the app benchmarks CUDA → ROCm → DirectML → CPU with a one-second dummy sentence on the available runtimes (PyTorch or ONNX) and locks in the fastest option. If the active backend spikes above the running average by more than `2σ` for three consecutive sentences it automatically falls back to the next fastest candidate.
+- Device priority matches the hardware:
+  - NVIDIA GPUs stick to PyTorch + CUDA (`use_half = true` keeps FP16 inference).
+  - AMD on Linux prefers ONNX + ROCm; Windows systems without NVIDIA prefer ONNX + DirectML.
+  - CPU-only mode is kept as a final fallback when no GPU runtime is available.
+- To pin a specific configuration, override `[kokoro].backend`, `[kokoro].device`, or `[kokoro].onnx_providers` and rerun. CLI overrides such as `--kokoro-backend onnx` or `--kokoro-provider DmlExecutionProvider` are still supported.
+- New pacing controls keep playback smooth: the engine batches sub‑0.5 s sentences until the group reaches roughly 0.8–1.2 s, keeps a 100–150 ms crossfade buffer between utterances, and flushes short clips automatically when speech pauses. The tunables (`short_threshold_ms`, `min_batch_ms`, `max_batch_ms`, `crossfade_ms`, etc.) live under `[kokoro]` in the config if you need to tweak them.
+- Kokoro playback is skipped automatically if Whisper returns Korean (non-translated) text, preventing Korean sentences from being spoken in the English voice.
 
 Voice Changer Integration
 

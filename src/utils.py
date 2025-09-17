@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-import math
 import os
+import re
 import wave
 from typing import Optional
 
 import numpy as np
 from pydub import AudioSegment
+
+_HANGUL_RE = re.compile(r"[\u3130-\u318F\uAC00-\uD7A3]")
 
 
 def parse_sd_device(device: Optional[object]) -> Optional[object]:
@@ -96,4 +98,12 @@ def write_wav_int16(path: str, samples: np.ndarray, sample_rate: int) -> None:
         wf.setsampwidth(2)
         wf.setframerate(int(sample_rate))
         wf.writeframes(data.tobytes())
+
+
+def contains_hangul(text: str) -> bool:
+    """Return True when the given text contains Hangul characters."""
+
+    if not text:
+        return False
+    return bool(_HANGUL_RE.search(str(text)))
 
