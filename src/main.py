@@ -16,8 +16,9 @@ from .vad import VADSegmenter
 from .asr import ASR
 from .tts_edge import EdgeTTS
 from .tts_piper import PiperTTS
+from .tts_kokoro import KokoroTTS
 from .voice_changer_client import VoiceChangerClient, VoiceChangerConfig
-from .utils import parse_sd_device
+from .utils import contains_hangul, parse_sd_device
 
 
 logger = logging.getLogger("vc-translator.main")
@@ -260,6 +261,26 @@ def apply_overrides(cfg: Dict[str, Any], args: argparse.Namespace) -> Dict[str, 
     if getattr(args, 'output_device', None):
         c.setdefault("device", {})["output_device"] = args.output_device
 
+    kokoro_cfg = c.setdefault("kokoro", {})
+    if getattr(args, 'kokoro_model', None):
+        kokoro_cfg["model"] = args.kokoro_model
+    if getattr(args, 'kokoro_speaker', None):
+        kokoro_cfg["speaker"] = args.kokoro_speaker
+    if getattr(args, 'kokoro_backend', None):
+        kokoro_cfg["backend"] = args.kokoro_backend
+    if getattr(args, 'kokoro_device', None):
+        kokoro_cfg["device"] = args.kokoro_device
+    if getattr(args, 'kokoro_onnx_model', None):
+        kokoro_cfg["onnx_model"] = args.kokoro_onnx_model
+    if getattr(args, 'kokoro_execution_provider', None):
+        kokoro_cfg["execution_provider"] = args.kokoro_execution_provider
+    if getattr(args, 'kokoro_provider', None):
+        kokoro_cfg["onnx_providers"] = list(args.kokoro_provider)
+    if getattr(args, 'kokoro_use_half', False):
+        kokoro_cfg["use_half"] = True
+    if getattr(args, 'kokoro_full_precision', False):
+        kokoro_cfg["use_half"] = False
+
     return c
 
 
@@ -390,7 +411,10 @@ async def run(cfg_path: str = "config/settings.toml", args: Optional[argparse.Na
 
     # 3) TTS
     output_device = cfg["device"].get("output_device") or None
-    if cfg["tts"]["engine"].lower() == "edge":
+    tts = None
+    tts_engine = (cfg["tts"].get("engine") or "edge").lower()
+    is_kokoro_engine = tts_engine == "kokoro"
+    if tts_engine == "edge":
         normalize_dbfs = cfg.get("stream", {}).get("normalize_dbfs")
         tts = EdgeTTS(
             voice=cfg["tts"]["voice"],
@@ -402,10 +426,10 @@ async def run(cfg_path: str = "config/settings.toml", args: Optional[argparse.Na
             voice_changer=voice_changer_client,
         )
 
-        async def speak(txt: str):
+        async def speak(txt: str, duration_ms: Optional[float] = None):
             return await tts.synth_to_play(txt)
 
-    else:
+    elif tts_engine == "piper":
         tts = PiperTTS(
             model_path=cfg["tts"]["piper_model"],
             out_sr=cfg["device"]["output_samplerate"],
@@ -415,8 +439,65 @@ async def run(cfg_path: str = "config/settings.toml", args: Optional[argparse.Na
             voice_changer=voice_changer_client,
         )
 
-        async def speak(txt: str):
+        async def speak(txt: str, duration_ms: Optional[float] = None):
             return tts.synth_to_play(txt)
+
+    elif tts_engine == "kokoro":
+        kokoro_cfg = cfg.get("kokoro", {}) or {}
+        providers = kokoro_cfg.get("onnx_providers")
+        if providers is not None and not isinstance(providers, (list, tuple)):
+            providers = [providers]
+        def _cfg_float(name: str, default: float) -> float:
+            value = kokoro_cfg.get(name, default)
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return default
+
+        def _cfg_int(name: str, default: int) -> int:
+            value = kokoro_cfg.get(name, default)
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+
+        backend_value = kokoro_cfg.get("backend", "auto")
+        if backend_value in (None, ""):
+            backend_value = "auto"
+        device_value = kokoro_cfg.get("device", "auto")
+        if device_value in (None, ""):
+            device_value = "auto"
+
+        tts = KokoroTTS(
+            model=kokoro_cfg.get("model", "hexgrad/Kokoro-82M"),
+            speaker=str(kokoro_cfg.get("speaker", "") or ""),
+            backend=str(backend_value),
+            device=str(device_value),
+            use_half=bool(kokoro_cfg.get("use_half", True)),
+            onnx_model=kokoro_cfg.get("onnx_model") or None,
+            onnx_providers=providers,
+            execution_provider=kokoro_cfg.get("execution_provider") or None,
+            pace=float(cfg["tts"].get("pace", 1.0) or 1.0),
+            volume_db=float(cfg["tts"].get("volume_db", 0.0) or 0.0),
+            out_sr=int(cfg["device"]["output_samplerate"]),
+            output_device=output_device,
+            voice_changer=voice_changer_client,
+            short_threshold_ms=_cfg_float("short_threshold_ms", 500.0),
+            min_batch_ms=_cfg_float("min_batch_ms", 900.0),
+            max_batch_ms=_cfg_float("max_batch_ms", 1200.0),
+            medium_min_ms=_cfg_float("medium_min_ms", 800.0),
+            medium_max_ms=_cfg_float("medium_max_ms", 1500.0),
+            crossfade_ms=_cfg_float("crossfade_ms", 120.0),
+            tail_flush_ms=_cfg_float("tail_flush_ms", 350.0),
+            short_idle_flush_ms=_cfg_float("short_idle_flush_ms", 650.0),
+            warmup_runs=_cfg_int("warmup_runs", 2),
+        )
+
+        async def speak(txt: str, duration_ms: Optional[float] = None):
+            return tts.synth_to_play(txt, src_duration_ms=duration_ms)
+
+    else:
+        raise ValueError(f"Unsupported TTS engine: {cfg['tts']['engine']}")
 
     print('Starting real-time KO->EN translation. Ctrl+C to stop.')
     mic.start()
@@ -438,9 +519,13 @@ async def run(cfg_path: str = "config/settings.toml", args: Optional[argparse.Na
             asr_elapsed = time.perf_counter() - asr_start
             logger.debug("ASR took %.3f s for %.1f ms segment", asr_elapsed, segment_ms)
             if text_en:
+                if is_kokoro_engine and contains_hangul(text_en):
+                    logger.info("Skipping Kokoro TTS (appears untranslated): %s", text_en)
+                    print(">>", text_en, "(skipped)")
+                    continue
                 print(">>", text_en)
                 tts_start = time.perf_counter()
-                vc_result = await speak(text_en)
+                vc_result = await speak(text_en, duration_ms=segment_ms)
                 tts_elapsed = time.perf_counter() - tts_start
                 tts_stats.append(tts_elapsed)
                 avg_tts = sum(tts_stats) / len(tts_stats)
@@ -462,6 +547,11 @@ async def run(cfg_path: str = "config/settings.toml", args: Optional[argparse.Na
             else:
                 logger.debug("ASR returned empty text (%.3f s)", asr_elapsed)
     finally:
+        if is_kokoro_engine and tts is not None:
+            try:
+                tts.flush()
+            except Exception:
+                logger.debug("Kokoro flush failed", exc_info=True)
         mic.stop()
 
 
@@ -470,7 +560,7 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument('--config', default='config/settings.toml', help='Path to settings TOML')
     p.add_argument('--list-devices', action='store_true', help='List audio input/output devices and exit')
     p.add_argument('--list-voices', action='store_true', help='List Edge TTS voices (network) and exit')
-    p.add_argument('--engine', choices=['edge', 'piper'], help='Override TTS engine')
+    p.add_argument('--engine', choices=['edge', 'piper', 'kokoro'], help='Override TTS engine')
     p.add_argument('--voice', help='Edge TTS voice name (e.g. en-US-AriaNeural)')
     p.add_argument('--piper-model', help='Path to Piper .onnx or .tar model')
     p.add_argument('--input-device', help='Input device name or index')
@@ -478,6 +568,15 @@ def _build_argparser() -> argparse.ArgumentParser:
     p.add_argument('--save-devices', action='store_true', help='Persist selected devices to config/local.toml')
     p.add_argument('--pace', type=float, help='TTS pace multiplier (1.0 = normal)')
     p.add_argument('--volume-db', type=float, help='TTS gain in dB e.g. -6.0 or +3.0')
+    p.add_argument('--kokoro-model', help='Kokoro model identifier or path')
+    p.add_argument('--kokoro-speaker', help='Kokoro speaker or voice preset')
+    p.add_argument('--kokoro-backend', choices=['auto', 'pytorch', 'onnx'], help='Backend for Kokoro TTS')
+    p.add_argument('--kokoro-device', help='Device for Kokoro backend (e.g. cuda, cuda:0, cpu, dml)')
+    p.add_argument('--kokoro-onnx-model', help='Path to Kokoro ONNX model when using the onnx backend')
+    p.add_argument('--kokoro-provider', action='append', help='Add ONNX Runtime execution provider for Kokoro (repeatable)')
+    p.add_argument('--kokoro-execution-provider', help='Primary ONNX execution provider name for Kokoro backend')
+    p.add_argument('--kokoro-use-half', action='store_true', help='Force Kokoro PyTorch backend to run in float16')
+    p.add_argument('--kokoro-full-precision', action='store_true', help='Force Kokoro PyTorch backend to run in float32')
     return p
 
 

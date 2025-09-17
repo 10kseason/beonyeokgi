@@ -27,6 +27,25 @@ piper_model = ""
 pace = 1.0
 volume_db = 0.0
 
+[kokoro]
+model = "hexgrad/Kokoro-82M"
+speaker = ""
+backend = "auto"  # auto | pytorch | onnx
+device = "auto"
+use_half = true
+onnx_model = ""
+onnx_providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+execution_provider = ""
+short_threshold_ms = 500.0
+min_batch_ms = 900.0
+max_batch_ms = 1200.0
+medium_min_ms = 800.0
+medium_max_ms = 1500.0
+crossfade_ms = 120.0
+tail_flush_ms = 350.0
+short_idle_flush_ms = 650.0
+warmup_runs = 2
+
 [stream]
 mode = "chunk"
 normalize_dbfs = -16
