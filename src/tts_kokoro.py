@@ -747,7 +747,7 @@ class KokoroTTS:
                     label="PyTorch CPU",
                 )
             )
-        elif ort_mod is not None and has_cpu_provider:
+        if ort_mod is not None and has_cpu_provider:
             plans.append(
                 BackendPlan(
                     backend="onnx",
