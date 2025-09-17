@@ -11,6 +11,7 @@ compute_type = "int8"
 task = "translate"
 language = "ko"
 beam_size = 1
+temperature = 0.0
 vad = true
 
 [vad]
@@ -21,7 +22,7 @@ max_utterance_sec = 9
 silence_end_ms = 400
 
 [tts]
-engine = "edge"
+engine = "kokoro"
 voice = "en-US-AriaNeural"
 piper_model = ""
 pace = 1.0
@@ -45,6 +46,9 @@ crossfade_ms = 120.0
 tail_flush_ms = 350.0
 short_idle_flush_ms = 650.0
 warmup_runs = 2
+
+[app]
+preset = "latency"
 
 [stream]
 mode = "chunk"

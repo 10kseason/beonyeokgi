@@ -9,6 +9,12 @@ import numpy as np
 from pydub import AudioSegment
 
 _HANGUL_RE = re.compile(r"[\u3130-\u318F\uAC00-\uD7A3]")
+_FILLER_RE = re.compile(
+    r"(?<![\u3130-\u318F\uAC00-\uD7A3])"  # no Hangul immediately before
+    r"((?:[\u3130-\u318F]*음+)|어+|그니까)(?:\s*요)?"  # filler body with optional 요
+    r"(?:[\s\u0020\u00A0\.,!?…~]*)",  # optional trailing whitespace/punctuation
+    re.IGNORECASE,
+)
 
 
 def parse_sd_device(device: Optional[object]) -> Optional[object]:
@@ -106,4 +112,14 @@ def contains_hangul(text: str) -> bool:
     if not text:
         return False
     return bool(_HANGUL_RE.search(str(text)))
+
+
+def remove_korean_fillers(text: str) -> str:
+    """Strip common Korean fillers such as 음, 어, and 그니까."""
+
+    if not text:
+        return ""
+    cleaned = _FILLER_RE.sub(" ", text)
+    cleaned = re.sub(r"\s+", " ", cleaned, flags=re.UNICODE)
+    return cleaned.strip()
 

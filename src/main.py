@@ -1,24 +1,19 @@
-import asyncio
+from __future__ import annotations
+
 import argparse
+import asyncio
 import logging
 import os
 import sys
-import time
-from collections import deque
 from typing import Any, Dict, Optional
 
+import sounddevice as sd
 import tomli
 import tomli_w
-import sounddevice as sd
 
-from .audio_io import MicReader
-from .vad import VADSegmenter
-from .asr import ASR
-from .tts_edge import EdgeTTS
-from .tts_piper import PiperTTS
-from .tts_kokoro import KokoroTTS
-from .voice_changer_client import VoiceChangerClient, VoiceChangerConfig
-from .utils import contains_hangul, parse_sd_device
+from .pipeline import LANGUAGE_OPTIONS, PRESETS, SharedState, TranslatorPipeline
+from .ui import TranslatorUI
+from .utils import parse_sd_device
 
 
 logger = logging.getLogger("vc-translator.main")
@@ -27,36 +22,32 @@ logger = logging.getLogger("vc-translator.main")
 def _deep_merge(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     keys = set(a.keys()) | set(b.keys())
-    for k in keys:
-        va = a.get(k)
-        vb = b.get(k)
+    for key in keys:
+        va = a.get(key)
+        vb = b.get(key)
         if isinstance(va, dict) and isinstance(vb, dict):
-            out[k] = _deep_merge(va, vb)
+            out[key] = _deep_merge(va, vb)
         elif vb is None:
-            out[k] = va
+            out[key] = va
         else:
-            out[k] = vb if vb is not None else va
+            out[key] = vb if vb is not None else va
     return out
 
 
 def select_input_device_gui(current: Optional[object] = None) -> Optional[int]:
-    """
-    Show a small Tkinter window to select an input device.
-    Returns the selected device index (int) or None if cancelled.
-    """
     try:
         import tkinter as tk
         from tkinter import ttk, messagebox
-    except Exception as e:
-        print(f"GUI not available for device selection: {e}")
+    except Exception as exc:  # pragma: no cover - GUI fallback
+        print(f"GUI not available for device selection: {exc}")
         return None
 
     devices = sd.query_devices()
     candidates: list[tuple[int, str]] = []
-    for idx, d in enumerate(devices):
-        if d.get("max_input_channels", 0) > 0:
-            name = d.get("name", f"Device {idx}")
-            label = f"[{idx}] {name} (in={d['max_input_channels']}, out={d['max_output_channels']})"
+    for idx, info in enumerate(devices):
+        if info.get("max_input_channels", 0) > 0:
+            name = info.get("name", f"Device {idx}")
+            label = f"[{idx}] {name} (in={info['max_input_channels']}, out={info['max_output_channels']})"
             candidates.append((idx, label))
 
     if not candidates:
@@ -69,7 +60,6 @@ def select_input_device_gui(current: Optional[object] = None) -> Optional[int]:
     root.resizable(True, True)
 
     tk.Label(root, text="Choose microphone / input device:").pack(anchor="w", padx=12, pady=(12, 6))
-
     frame = tk.Frame(root)
     frame.pack(fill="both", expand=True, padx=12)
 
@@ -82,66 +72,64 @@ def select_input_device_gui(current: Optional[object] = None) -> Optional[int]:
     for _, label in candidates:
         listbox.insert(tk.END, label)
 
-    # preselect
-    pre_idx: Optional[int] = None
-    cur = parse_sd_device(current)
-    if isinstance(cur, int):
-        for i, (idx, _) in enumerate(candidates):
-            if idx == cur:
-                pre_idx = i
+    selected_index: Optional[int] = None
+    current_val = parse_sd_device(current)
+    if isinstance(current_val, int):
+        for pos, (idx, _) in enumerate(candidates):
+            if idx == current_val:
+                selected_index = pos
                 break
-    if pre_idx is None and isinstance(cur, str):
-        for i, (idx, _) in enumerate(candidates):
-            if cur in candidates[i][1]:
-                pre_idx = i
+    elif isinstance(current_val, str):
+        for pos, (_, label) in enumerate(candidates):
+            if current_val in label:
+                selected_index = pos
                 break
-    if pre_idx is None:
-        pre_idx = 0
-    listbox.selection_set(pre_idx)
-    listbox.see(pre_idx)
+    if selected_index is None:
+        selected_index = 0
+    listbox.selection_set(selected_index)
+    listbox.see(selected_index)
 
-    selected: dict[str, Optional[int]] = {"idx": None}
+    result: dict[str, Optional[int]] = {"idx": None}
 
-    def on_ok():
-        sel = listbox.curselection()
-        if not sel:
+    def on_ok() -> None:
+        selection = listbox.curselection()
+        if not selection:
             messagebox.showwarning("Select device", "Please select an input device.")
             return
-        pos = sel[0]
-        selected["idx"] = candidates[pos][0]
+        result["idx"] = candidates[selection[0]][0]
         root.destroy()
 
-    def on_cancel():
-        selected["idx"] = None
+    def on_cancel() -> None:
+        result["idx"] = None
         root.destroy()
 
-    btns = tk.Frame(root)
-    btns.pack(fill="x", padx=12, pady=12)
-    ttk.Button(btns, text="OK", command=on_ok).pack(side="right")
-    ttk.Button(btns, text="Cancel", command=on_cancel).pack(side="right", padx=(0, 8))
+    buttons = tk.Frame(root)
+    buttons.pack(fill="x", padx=12, pady=12)
+    ttk.Button(buttons, text="OK", command=on_ok).pack(side="right")
+    ttk.Button(buttons, text="Cancel", command=on_cancel).pack(side="right", padx=(0, 8))
 
     root.mainloop()
-    return selected["idx"]
+    return result["idx"]
 
 
-def select_output_device_gui(current: Optional[object] = None, title: str = "Select Output Device", prompt: str = "Choose speaker / output device:") -> Optional[int]:
-    """
-    Show a small Tkinter window to select an output device.
-    Returns the selected device index (int) or None if cancelled.
-    """
+def select_output_device_gui(
+    current: Optional[object] = None,
+    title: str = "Select Output Device",
+    prompt: str = "Choose speaker / output device:",
+) -> Optional[int]:
     try:
         import tkinter as tk
         from tkinter import ttk, messagebox
-    except Exception as e:
-        print(f"GUI not available for device selection: {e}")
+    except Exception as exc:  # pragma: no cover - GUI fallback
+        print(f"GUI not available for device selection: {exc}")
         return None
 
     devices = sd.query_devices()
     candidates: list[tuple[int, str]] = []
-    for idx, d in enumerate(devices):
-        if d.get("max_output_channels", 0) > 0:
-            name = d.get("name", f"Device {idx}")
-            label = f"[{idx}] {name} (in={d['max_input_channels']}, out={d['max_output_channels']})"
+    for idx, info in enumerate(devices):
+        if info.get("max_output_channels", 0) > 0:
+            name = info.get("name", f"Device {idx}")
+            label = f"[{idx}] {name} (in={info['max_input_channels']}, out={info['max_output_channels']})"
             candidates.append((idx, label))
 
     if not candidates:
@@ -154,7 +142,6 @@ def select_output_device_gui(current: Optional[object] = None, title: str = "Sel
     root.resizable(True, True)
 
     tk.Label(root, text=prompt).pack(anchor="w", padx=12, pady=(12, 6))
-
     frame = tk.Frame(root)
     frame.pack(fill="both", expand=True, padx=12)
 
@@ -167,422 +154,232 @@ def select_output_device_gui(current: Optional[object] = None, title: str = "Sel
     for _, label in candidates:
         listbox.insert(tk.END, label)
 
-    # preselect
-    pre_idx: Optional[int] = None
-    cur = parse_sd_device(current)
-    if isinstance(cur, int):
-        for i, (idx, _) in enumerate(candidates):
-            if idx == cur:
-                pre_idx = i
+    selected_index: Optional[int] = None
+    current_val = parse_sd_device(current)
+    if isinstance(current_val, int):
+        for pos, (idx, _) in enumerate(candidates):
+            if idx == current_val:
+                selected_index = pos
                 break
-    if pre_idx is None and isinstance(cur, str):
-        for i, (idx, _) in enumerate(candidates):
-            if cur in candidates[i][1]:
-                pre_idx = i
+    elif isinstance(current_val, str):
+        for pos, (_, label) in enumerate(candidates):
+            if current_val in label:
+                selected_index = pos
                 break
-    if pre_idx is None:
-        pre_idx = 0
-    listbox.selection_set(pre_idx)
-    listbox.see(pre_idx)
+    if selected_index is None:
+        selected_index = 0
+    listbox.selection_set(selected_index)
+    listbox.see(selected_index)
 
-    selected: dict[str, Optional[int]] = {"idx": None}
+    result: dict[str, Optional[int]] = {"idx": None}
 
-    def on_ok():
-        sel = listbox.curselection()
-        if not sel:
+    def on_ok() -> None:
+        selection = listbox.curselection()
+        if not selection:
             messagebox.showwarning("Select device", "Please select an output device.")
             return
-        pos = sel[0]
-        selected["idx"] = candidates[pos][0]
+        result["idx"] = candidates[selection[0]][0]
         root.destroy()
 
-    def on_cancel():
-        selected["idx"] = None
+    def on_cancel() -> None:
+        result["idx"] = None
         root.destroy()
 
-    btns = tk.Frame(root)
-    btns.pack(fill="x", padx=12, pady=12)
-    ttk.Button(btns, text="OK", command=on_ok).pack(side="right")
-    ttk.Button(btns, text="Cancel", command=on_cancel).pack(side="right", padx=(0, 8))
+    buttons = tk.Frame(root)
+    buttons.pack(fill="x", padx=12, pady=12)
+    ttk.Button(buttons, text="OK", command=on_ok).pack(side="right")
+    ttk.Button(buttons, text="Cancel", command=on_cancel).pack(side="right", padx=(0, 8))
 
     root.mainloop()
-    return selected["idx"]
+    return result["idx"]
 
 
-def _save_devices_local(cfg_path: str, input_dev: Optional[int], output_dev: Optional[int]) -> None:
-    """Persist selected devices to config/local.toml next to cfg_path."""
+def describe_device(device: Optional[object]) -> str:
+    if device in (None, "", "default"):
+        return "기본 장치"
+    parsed = parse_sd_device(device)
+    try:
+        devices = sd.query_devices()
+    except Exception:
+        return str(parsed)
+    if isinstance(parsed, int) and 0 <= parsed < len(devices):
+        name = devices[parsed].get("name", f"Device {parsed}")
+        return f"[{parsed}] {name}"
+    if isinstance(parsed, str):
+        return parsed
+    return str(parsed)
+
+
+def _save_devices_local(
+    cfg_path: str,
+    input_dev: Optional[object],
+    output_dev: Optional[object],
+) -> None:
     base_dir = os.path.dirname(cfg_path)
     local_path = os.path.join(base_dir, "local.toml")
-    data: Dict[str, Any] = {"device": {}}
+    data: Dict[str, Dict[str, Any]] = {"device": {}}
     if input_dev is not None:
-        data["device"]["input_device"] = input_dev
+        data["device"]["input_device"] = parse_sd_device(input_dev)
     if output_dev is not None:
-        data["device"]["output_device"] = output_dev
+        data["device"]["output_device"] = parse_sd_device(output_dev)
     try:
         os.makedirs(base_dir, exist_ok=True)
-        with open(local_path, "wb") as f:
-            f.write(tomli_w.dumps(data).encode("utf-8"))
-        print(f"Saved device selection to {local_path}")
-    except Exception as e:
-        print(f"Failed to save device selection: {e}")
+        with open(local_path, "wb") as fh:
+            fh.write(tomli_w.dumps(data).encode("utf-8"))
+        logger.debug("Saved device selection to %s", local_path)
+    except Exception as exc:
+        logger.warning("Failed to save device selection: %s", exc)
 
 
 def load_cfg(path: str = "config/settings.toml") -> Dict[str, Any]:
-    with open(path, "rb") as f:
-        base = tomli.load(f)
+    with open(path, "rb") as fh:
+        base = tomli.load(fh)
     local_path = os.path.join(os.path.dirname(path), "local.toml")
     if os.path.isfile(local_path):
         try:
             with open(local_path, "rb") as lf:
-                local = tomli.load(lf)
-            base = _deep_merge(base, local)
+                local_cfg = tomli.load(lf)
+            base = _deep_merge(base, local_cfg)
         except Exception:
-            pass
+            logger.warning("Failed to read %s", local_path, exc_info=True)
     return base
 
 
 def apply_overrides(cfg: Dict[str, Any], args: argparse.Namespace) -> Dict[str, Any]:
-    """Overlay selected CLI overrides onto loaded config dict."""
-    c = {k: (v.copy() if isinstance(v, dict) else v) for k, v in cfg.items()}
+    merged = {k: (v.copy() if isinstance(v, dict) else v) for k, v in cfg.items()}
+    device_cfg = merged.setdefault("device", {})
+    asr_cfg = merged.setdefault("asr", {})
+    app_cfg = merged.setdefault("app", {})
 
-    if getattr(args, 'engine', None):
-        c.setdefault("tts", {})["engine"] = args.engine
-    if getattr(args, 'voice', None):
-        c.setdefault("tts", {})["voice"] = args.voice
-    if getattr(args, 'piper_model', None):
-        c.setdefault("tts", {})["piper_model"] = args.piper_model
-    if getattr(args, 'pace', None) is not None:
-        c.setdefault("tts", {})["pace"] = float(args.pace)
-    if getattr(args, 'volume_db', None) is not None:
-        c.setdefault("tts", {})["volume_db"] = float(args.volume_db)
-
-    if getattr(args, 'input_device', None):
-        c.setdefault("device", {})["input_device"] = args.input_device
-    if getattr(args, 'output_device', None):
-        c.setdefault("device", {})["output_device"] = args.output_device
-
-    kokoro_cfg = c.setdefault("kokoro", {})
-    if getattr(args, 'kokoro_model', None):
-        kokoro_cfg["model"] = args.kokoro_model
-    if getattr(args, 'kokoro_speaker', None):
-        kokoro_cfg["speaker"] = args.kokoro_speaker
-    if getattr(args, 'kokoro_backend', None):
-        kokoro_cfg["backend"] = args.kokoro_backend
-    if getattr(args, 'kokoro_device', None):
-        kokoro_cfg["device"] = args.kokoro_device
-    if getattr(args, 'kokoro_onnx_model', None):
-        kokoro_cfg["onnx_model"] = args.kokoro_onnx_model
-    if getattr(args, 'kokoro_execution_provider', None):
-        kokoro_cfg["execution_provider"] = args.kokoro_execution_provider
-    if getattr(args, 'kokoro_provider', None):
-        kokoro_cfg["onnx_providers"] = list(args.kokoro_provider)
-    if getattr(args, 'kokoro_use_half', False):
-        kokoro_cfg["use_half"] = True
-    if getattr(args, 'kokoro_full_precision', False):
-        kokoro_cfg["use_half"] = False
-
-    return c
+    if getattr(args, "input_device", None) is not None:
+        device_cfg["input_device"] = parse_sd_device(args.input_device)
+    if getattr(args, "output_device", None) is not None:
+        device_cfg["output_device"] = parse_sd_device(args.output_device)
+    if getattr(args, "language", None):
+        asr_cfg["language"] = args.language
+    if getattr(args, "preset", None):
+        app_cfg["preset"] = args.preset
+    return merged
 
 
 def print_devices() -> None:
-    devs = sd.query_devices()
+    devices = sd.query_devices()
     print("Input Devices:")
-    for idx, d in enumerate(devs):
-        if d.get("max_input_channels", 0) > 0:
-            name = d.get("name", f"Device {idx}")
-            print(f"  [{idx}] {name}  (in={d['max_input_channels']}, out={d['max_output_channels']})")
+    for idx, info in enumerate(devices):
+        if info.get("max_input_channels", 0) > 0:
+            name = info.get("name", f"Device {idx}")
+            print(f"  [{idx}] {name}  (in={info['max_input_channels']}, out={info['max_output_channels']})")
     print("")
     print("Output Devices:")
-    for idx, d in enumerate(devs):
-        if d.get("max_output_channels", 0) > 0:
-            name = d.get("name", f"Device {idx}")
-            print(f"  [{idx}] {name}  (in={d['max_input_channels']}, out={d['max_output_channels']})")
+    for idx, info in enumerate(devices):
+        if info.get("max_output_channels", 0) > 0:
+            name = info.get("name", f"Device {idx}")
+            print(f"  [{idx}] {name}  (in={info['max_input_channels']}, out={info['max_output_channels']})")
 
 
 async def list_edge_voices() -> None:
     try:
         import edge_tts
-    except Exception as e:
-        print(f"edge-tts not installed or failed to import: {e}")
+    except Exception as exc:  # pragma: no cover - optional dependency
+        print(f"edge-tts not installed or failed to import: {exc}")
         return
     voices = await edge_tts.list_voices()
     print("Edge TTS Voices (English locales):")
-    for v in voices:
-        if v.get("Locale", "").startswith("en-"):
-            print(f"  {v['ShortName']}  ({v['Gender']}, {v['Locale']})")
+    for voice in voices:
+        if voice.get("Locale", "").startswith("en-"):
+            print(f"  {voice['ShortName']}  ({voice['Gender']}, {voice['Locale']})")
 
 
-async def run(cfg_path: str = "config/settings.toml", args: Optional[argparse.Namespace] = None):
+def run_app(cfg_path: str, args: Optional[argparse.Namespace]) -> None:
     cfg = load_cfg(cfg_path)
     if args is not None:
         cfg = apply_overrides(cfg, args)
 
-    # Prompt for input device via GUI unless provided via CLI
-    if not (args and getattr(args, "input_device", None)):
-        chosen = select_input_device_gui(current=cfg["device"].get("input_device"))
+    device_cfg = cfg.setdefault("device", {})
+    asr_cfg = cfg.setdefault("asr", {})
+    app_cfg = cfg.setdefault("app", {})
+
+    language = asr_cfg.get("language", "ko")
+    supported_languages = {code for code, _ in LANGUAGE_OPTIONS}
+    if language not in supported_languages:
+        language = "ko"
+        asr_cfg["language"] = language
+
+    preset_key = app_cfg.get("preset", "latency")
+    if preset_key not in PRESETS:
+        preset_key = "latency"
+        app_cfg["preset"] = preset_key
+
+    input_device = device_cfg.get("input_device")
+    output_device = device_cfg.get("output_device")
+
+    if input_device in (None, ""):
+        chosen = select_input_device_gui()
         if chosen is None:
             print("Input selection cancelled. Exiting.")
             return
-        cfg.setdefault("device", {})["input_device"] = chosen
-    # Prompt for output device via GUI unless provided via CLI
-    if not (args and getattr(args, "output_device", None)):
-        chosen_out = select_output_device_gui(current=cfg["device"].get("output_device"))
-        if chosen_out is None:
+        input_device = chosen
+        device_cfg["input_device"] = chosen
+
+    if output_device in (None, ""):
+        chosen = select_output_device_gui()
+        if chosen is None:
             print("Output selection cancelled. Exiting.")
             return
-        cfg.setdefault("device", {})["output_device"] = chosen_out
+        output_device = chosen
+        device_cfg["output_device"] = chosen
 
-    # Offer to persist selection unless --no-save-devices
-    auto_save = bool(args and getattr(args, "save_devices", False))
-    if auto_save:
-        _save_devices_local(cfg_path, cfg["device"].get("input_device"), cfg["device"].get("output_device"))
-    else:
-        try:
-            import tkinter as tk
-            from tkinter import messagebox
-            r = tk.Tk(); r.withdraw()
-            if messagebox.askyesno("Save devices", "Save selected devices for next run?"):
-                _save_devices_local(cfg_path, cfg["device"].get("input_device"), cfg["device"].get("output_device"))
-            r.destroy()
-        except Exception:
-            pass
+    input_label = describe_device(input_device)
+    output_label = describe_device(output_device)
+    _save_devices_local(cfg_path, input_device, output_device)
 
-    # 1) IO
-    mic = MicReader(
-        sr=cfg["device"]["input_samplerate"],
-        block_ms=cfg["vad"]["frame_ms"],
-        input_device=cfg["device"].get("input_device") or None,
-    )
-    vad = VADSegmenter(
-        sr=cfg["device"]["input_samplerate"],
-        frame_ms=cfg["vad"]["frame_ms"],
-        aggressiveness=cfg["vad"]["aggressiveness"],
-        min_speech_sec=cfg["vad"]["min_speech_sec"],
-        max_utt_sec=cfg["vad"]["max_utterance_sec"],
-        silence_end_ms=cfg["vad"]["silence_end_ms"],
-    )
+    state = SharedState(language, preset_key, input_device, output_device, input_label, output_label)
+    state.set_labels(input_label, output_label)
 
-    # 2) ASR
-    asr = ASR(
-        model=cfg["asr"]["whisper_model"],
-        device=cfg["asr"]["device"],
-        compute_type=cfg["asr"]["compute_type"],
-        task=cfg["asr"]["task"],
-        language=cfg["asr"]["language"],
-        beam_size=cfg["asr"]["beam_size"],
-        input_sr=cfg["device"]["input_samplerate"],
-    )
+    def save_devices_callback(inp: Optional[object], out: Optional[object]) -> None:
+        _save_devices_local(cfg_path, inp, out)
 
-    vc_cfg = cfg.get("voice_changer", {}) or {}
-    voice_changer_client: Optional[VoiceChangerClient] = None
+    pipeline = TranslatorPipeline(cfg, state, save_devices_callback)
 
-    def _maybe_sr(key: str) -> Optional[int]:
-        value = vc_cfg.get(key)
-        try:
-            ivalue = int(value)
-        except (TypeError, ValueError):
-            return None
-        return ivalue if ivalue > 0 else None
+    def on_change_input() -> None:
+        selected = select_input_device_gui(current=state.get_active_input_device())
+        if selected is None:
+            return
+        state.request_input_device(selected, describe_device(selected))
 
-    wants_vc = bool(vc_cfg.get("enabled")) or bool(vc_cfg.get("save_original_path")) or bool(vc_cfg.get("save_converted_path"))
-    fallback_device_cfg = vc_cfg.get("fallback_output_device")
-    if wants_vc:
-        if not fallback_device_cfg:
-            chosen_fallback = select_output_device_gui(
-                title="Select Fallback Output Device",
-                prompt="Choose fallback output device (optional, cancel to skip):"
-            )
-            if chosen_fallback is not None:
-                fallback_device_cfg = chosen_fallback
-        voice_changer_client = VoiceChangerClient(
-            VoiceChangerConfig(
-                enabled=bool(vc_cfg.get("enabled", False)),
-                base_url=str(vc_cfg.get("base_url", "http://localhost:18000")),
-                endpoint=str(vc_cfg.get("endpoint", "/api/voice-changer/convert_chunk")),
-                input_sample_rate=_maybe_sr("input_sample_rate"),
-                output_sample_rate=_maybe_sr("output_sample_rate"),
-                timeout_sec=float(vc_cfg.get("timeout_sec", 5.0) or 5.0),
-                save_original_path=vc_cfg.get("save_original_path") or None,
-                save_converted_path=vc_cfg.get("save_converted_path") or None,
-                fallback_endpoint=str(vc_cfg.get("fallback_endpoint", "/api/voice-changer/convert_chunk_bulk")),
-                fallback_output_device=fallback_device_cfg if fallback_device_cfg not in ("", None) else None,
-            )
-        )
+    def on_change_output() -> None:
+        selected = select_output_device_gui(current=state.get_active_output_device())
+        if selected is None:
+            return
+        state.request_output_device(selected, describe_device(selected))
 
-    # 3) TTS
-    output_device = cfg["device"].get("output_device") or None
-    tts = None
-    tts_engine = (cfg["tts"].get("engine") or "edge").lower()
-    is_kokoro_engine = tts_engine == "kokoro"
-    if tts_engine == "edge":
-        normalize_dbfs = cfg.get("stream", {}).get("normalize_dbfs")
-        tts = EdgeTTS(
-            voice=cfg["tts"]["voice"],
-            pace=cfg["tts"]["pace"],
-            volume_db=cfg["tts"]["volume_db"],
-            out_sr=cfg["device"]["output_samplerate"],
-            output_device=output_device,
-            normalize_dbfs=normalize_dbfs,
-            voice_changer=voice_changer_client,
-        )
+    def on_close() -> None:
+        pipeline.stop()
 
-        async def speak(txt: str, duration_ms: Optional[float] = None):
-            return await tts.synth_to_play(txt)
-
-    elif tts_engine == "piper":
-        tts = PiperTTS(
-            model_path=cfg["tts"]["piper_model"],
-            out_sr=cfg["device"]["output_samplerate"],
-            pace=cfg["tts"]["pace"],
-            volume_db=cfg["tts"]["volume_db"],
-            output_device=output_device,
-            voice_changer=voice_changer_client,
-        )
-
-        async def speak(txt: str, duration_ms: Optional[float] = None):
-            return tts.synth_to_play(txt)
-
-    elif tts_engine == "kokoro":
-        kokoro_cfg = cfg.get("kokoro", {}) or {}
-        providers = kokoro_cfg.get("onnx_providers")
-        if providers is not None and not isinstance(providers, (list, tuple)):
-            providers = [providers]
-        def _cfg_float(name: str, default: float) -> float:
-            value = kokoro_cfg.get(name, default)
-            try:
-                return float(value)
-            except (TypeError, ValueError):
-                return default
-
-        def _cfg_int(name: str, default: int) -> int:
-            value = kokoro_cfg.get(name, default)
-            try:
-                return int(value)
-            except (TypeError, ValueError):
-                return default
-
-        backend_value = kokoro_cfg.get("backend", "auto")
-        if backend_value in (None, ""):
-            backend_value = "auto"
-        device_value = kokoro_cfg.get("device", "auto")
-        if device_value in (None, ""):
-            device_value = "auto"
-
-        tts = KokoroTTS(
-            model=kokoro_cfg.get("model", "hexgrad/Kokoro-82M"),
-            speaker=str(kokoro_cfg.get("speaker", "") or ""),
-            backend=str(backend_value),
-            device=str(device_value),
-            use_half=bool(kokoro_cfg.get("use_half", True)),
-            onnx_model=kokoro_cfg.get("onnx_model") or None,
-            onnx_providers=providers,
-            execution_provider=kokoro_cfg.get("execution_provider") or None,
-            pace=float(cfg["tts"].get("pace", 1.0) or 1.0),
-            volume_db=float(cfg["tts"].get("volume_db", 0.0) or 0.0),
-            out_sr=int(cfg["device"]["output_samplerate"]),
-            output_device=output_device,
-            voice_changer=voice_changer_client,
-            short_threshold_ms=_cfg_float("short_threshold_ms", 500.0),
-            min_batch_ms=_cfg_float("min_batch_ms", 900.0),
-            max_batch_ms=_cfg_float("max_batch_ms", 1200.0),
-            medium_min_ms=_cfg_float("medium_min_ms", 800.0),
-            medium_max_ms=_cfg_float("medium_max_ms", 1500.0),
-            crossfade_ms=_cfg_float("crossfade_ms", 120.0),
-            tail_flush_ms=_cfg_float("tail_flush_ms", 350.0),
-            short_idle_flush_ms=_cfg_float("short_idle_flush_ms", 650.0),
-            warmup_runs=_cfg_int("warmup_runs", 2),
-        )
-
-        async def speak(txt: str, duration_ms: Optional[float] = None):
-            return tts.synth_to_play(txt, src_duration_ms=duration_ms)
-
-    else:
-        raise ValueError(f"Unsupported TTS engine: {cfg['tts']['engine']}")
-
-    print('Starting real-time KO->EN translation. Ctrl+C to stop.')
-    mic.start()
-    vc_stats = deque(maxlen=50)
-    tts_stats = deque(maxlen=50)
+    ui = TranslatorUI(state, on_change_input, on_change_output, on_close)
+    pipeline.start()
     try:
-        while True:
-            frame = mic.read()
-            segment = vad.push(frame)
-            if segment is None:
-                continue
-            segment_samples = len(segment) // 2
-            segment_ms = 0.0
-            input_sr = cfg["device"]["input_samplerate"]
-            if segment_samples > 0 and input_sr > 0:
-                segment_ms = (segment_samples / float(input_sr)) * 1000.0
-            asr_start = time.perf_counter()
-            text_en = asr.transcribe_translate(segment)
-            asr_elapsed = time.perf_counter() - asr_start
-            logger.debug("ASR took %.3f s for %.1f ms segment", asr_elapsed, segment_ms)
-            if text_en:
-                if is_kokoro_engine and contains_hangul(text_en):
-                    logger.info("Skipping Kokoro TTS (appears untranslated): %s", text_en)
-                    print(">>", text_en, "(skipped)")
-                    continue
-                print(">>", text_en)
-                tts_start = time.perf_counter()
-                vc_result = await speak(text_en, duration_ms=segment_ms)
-                tts_elapsed = time.perf_counter() - tts_start
-                tts_stats.append(tts_elapsed)
-                avg_tts = sum(tts_stats) / len(tts_stats)
-                if voice_changer_client is not None:
-                    if vc_result is not None:
-                        vc_stats.append(1 if vc_result else 0)
-                    total_chunks, failed_chunks = voice_changer_client.stats()
-                    success_pct = (sum(vc_stats) / len(vc_stats) * 100.0) if vc_stats else None
-                    logger.debug(
-                        "TTS took %.3f s (avg %.3f s); VC chunks total=%d failed=%d success=%s",
-                        tts_elapsed,
-                        avg_tts,
-                        total_chunks,
-                        failed_chunks,
-                        f"{success_pct:.1f}%" if success_pct is not None else "n/a",
-                    )
-                else:
-                    logger.debug("TTS took %.3f s (avg %.3f s)", tts_elapsed, avg_tts)
-            else:
-                logger.debug("ASR returned empty text (%.3f s)", asr_elapsed)
+        ui.run()
     finally:
-        if is_kokoro_engine and tts is not None:
-            try:
-                tts.flush()
-            except Exception:
-                logger.debug("Kokoro flush failed", exc_info=True)
-        mic.stop()
+        pipeline.stop()
 
 
 def _build_argparser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description='Realtime Korean->English speech translator')
-    p.add_argument('--config', default='config/settings.toml', help='Path to settings TOML')
-    p.add_argument('--list-devices', action='store_true', help='List audio input/output devices and exit')
-    p.add_argument('--list-voices', action='store_true', help='List Edge TTS voices (network) and exit')
-    p.add_argument('--engine', choices=['edge', 'piper', 'kokoro'], help='Override TTS engine')
-    p.add_argument('--voice', help='Edge TTS voice name (e.g. en-US-AriaNeural)')
-    p.add_argument('--piper-model', help='Path to Piper .onnx or .tar model')
-    p.add_argument('--input-device', help='Input device name or index')
-    p.add_argument('--output-device', help='Output device name or index')
-    p.add_argument('--save-devices', action='store_true', help='Persist selected devices to config/local.toml')
-    p.add_argument('--pace', type=float, help='TTS pace multiplier (1.0 = normal)')
-    p.add_argument('--volume-db', type=float, help='TTS gain in dB e.g. -6.0 or +3.0')
-    p.add_argument('--kokoro-model', help='Kokoro model identifier or path')
-    p.add_argument('--kokoro-speaker', help='Kokoro speaker or voice preset')
-    p.add_argument('--kokoro-backend', choices=['auto', 'pytorch', 'onnx'], help='Backend for Kokoro TTS')
-    p.add_argument('--kokoro-device', help='Device for Kokoro backend (e.g. cuda, cuda:0, cpu, dml)')
-    p.add_argument('--kokoro-onnx-model', help='Path to Kokoro ONNX model when using the onnx backend')
-    p.add_argument('--kokoro-provider', action='append', help='Add ONNX Runtime execution provider for Kokoro (repeatable)')
-    p.add_argument('--kokoro-execution-provider', help='Primary ONNX execution provider name for Kokoro backend')
-    p.add_argument('--kokoro-use-half', action='store_true', help='Force Kokoro PyTorch backend to run in float16')
-    p.add_argument('--kokoro-full-precision', action='store_true', help='Force Kokoro PyTorch backend to run in float32')
-    return p
+    parser = argparse.ArgumentParser(description="Realtime speech translator")
+    parser.add_argument("--config", default="config/settings.toml", help="Path to settings TOML")
+    parser.add_argument("--list-devices", action="store_true", help="List audio input/output devices and exit")
+    parser.add_argument("--list-voices", action="store_true", help="List Edge TTS voices (network) and exit")
+    parser.add_argument("--input-device", help="Input device index or name")
+    parser.add_argument("--output-device", help="Output device index or name")
+    parser.add_argument("--language", choices=[code for code, _ in LANGUAGE_OPTIONS], help="Force input language")
+    parser.add_argument("--preset", choices=list(PRESETS.keys()), help="Select processing preset")
+    return parser
 
 
 if __name__ == "__main__":
-    ap = _build_argparser()
-    ns = ap.parse_args()
+    logging.basicConfig(level=logging.INFO)
+    parser = _build_argparser()
+    ns = parser.parse_args()
     if ns.list_devices:
         print_devices()
         sys.exit(0)
@@ -594,6 +391,6 @@ if __name__ == "__main__":
         sys.exit(0)
 
     try:
-        asyncio.run(run(cfg_path=ns.config, args=ns))
+        run_app(cfg_path=ns.config, args=ns)
     except KeyboardInterrupt:
         pass

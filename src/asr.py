@@ -11,6 +11,8 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     KoEnTranslator = None  # type: ignore
 
+from .utils import remove_korean_fillers
+
 
 @dataclass
 class ASRConfig:
@@ -21,6 +23,7 @@ class ASRConfig:
     language: str = "ko"
     beam_size: int = 1
     input_sr: int = 16000
+    temperature: float = 0.0
 
 
 class ASR:
@@ -33,6 +36,7 @@ class ASR:
         language: str = "ko",
         beam_size: int = 1,
         input_sr: int = 16000,
+        temperature: float = 0.0,
     ) -> None:
         self.cfg = ASRConfig(
             model=model,
@@ -42,6 +46,7 @@ class ASR:
             language=language,
             beam_size=beam_size,
             input_sr=input_sr,
+            temperature=temperature,
         )
         self.model = WhisperModel(
             self.cfg.model,
@@ -49,24 +54,10 @@ class ASR:
             compute_type=self.cfg.compute_type,
         )
         self._translator: Optional["KoEnTranslator"] = None
+        self._translator_init_failed = False
         self._use_post_translate = False
-        if (
-            KoEnTranslator is not None
-            and self.cfg.task.lower() == "translate"
-            and (self.cfg.language is None or self.cfg.language.lower() in {"ko", "korean"})
-        ):
-            try:
-                self._translator = KoEnTranslator()
-                self._use_post_translate = True
-            except Exception as exc:
-                print(
-                    "[Translator] Failed to initialize Ko->En translator: "
-                    f"{exc}. Falling back to Whisper output."
-                )
-        elif self.cfg.task.lower() == "translate" and KoEnTranslator is None:
-            print(
-                "[Translator] torch/transformers not available; falling back to Whisper output."
-            )
+        self._base_task = task
+        self.set_language(language)
 
     @staticmethod
     def _bytes_to_float32_mono(pcm_bytes: bytes) -> np.ndarray:
@@ -101,17 +92,20 @@ class ASR:
         data_f32 = self._resample_to_16k(data_f32)
         if data_f32.size == 0:
             return ""
-        task = "transcribe" if self._use_post_translate else self.cfg.task
+        task = "transcribe" if self._use_post_translate else self._base_task
         segments, _ = self.model.transcribe(
             data_f32,
             language=self.cfg.language,
             task=task,
             beam_size=self.cfg.beam_size,
             vad_filter=True,
+            temperature=float(self.cfg.temperature),
         )
         text = " ".join(s.text.strip() for s in segments).strip()
         if not text:
             return ""
+        if self._use_post_translate or (self.cfg.language and str(self.cfg.language).lower().startswith("ko")):
+            text = remove_korean_fillers(text)
         if self._use_post_translate and self._translator is not None:
             try:
                 return self._translator.translate(text)
@@ -121,3 +115,34 @@ class ASR:
                     f"{exc}. Returning original transcription."
                 )
         return text
+
+    def set_language(self, language: Optional[str]) -> None:
+        normalized = (language or "").strip().lower()
+        self.cfg.language = normalized or None
+        wants_translator = (
+            self._base_task.lower() == "translate"
+            and normalized in {"ko", "ko-kr", "korean"}
+        )
+        if wants_translator and KoEnTranslator is not None:
+            if self._translator is None and not self._translator_init_failed:
+                try:
+                    self._translator = KoEnTranslator()
+                except Exception as exc:
+                    print(
+                        "[Translator] Failed to initialize Ko->En translator: "
+                        f"{exc}. Falling back to Whisper output."
+                    )
+                    self._translator = None
+                    self._translator_init_failed = True
+            self._use_post_translate = self._translator is not None
+        else:
+            if wants_translator and KoEnTranslator is None and not self._translator_init_failed:
+                print(
+                    "[Translator] torch/transformers not available; falling back to Whisper output."
+                )
+                self._translator_init_failed = True
+            self._use_post_translate = False
+
+    def set_decoding_options(self, beam_size: int, temperature: float) -> None:
+        self.cfg.beam_size = max(1, int(beam_size))
+        self.cfg.temperature = float(max(0.0, temperature))
