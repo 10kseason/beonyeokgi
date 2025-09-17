@@ -9,6 +9,7 @@ import numpy as np
 from pydub import AudioSegment
 
 _HANGUL_RE = re.compile(r"[\u3130-\u318F\uAC00-\uD7A3]")
+_CJK_RE = re.compile(r"[\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]")
 _FILLER_RE = re.compile(
     r"(?<![\u3130-\u318F\uAC00-\uD7A3])"  # no Hangul immediately before
     r"((?:[\u3130-\u318F]*음+)|어+|그니까)(?:\s*요)?"  # filler body with optional 요
@@ -112,6 +113,16 @@ def contains_hangul(text: str) -> bool:
     if not text:
         return False
     return bool(_HANGUL_RE.search(str(text)))
+
+
+def contains_cjk(text: str) -> bool:
+    """Return True if the text contains Hangul, Kana, or Han characters."""
+
+    if not text:
+        return False
+    if contains_hangul(text):
+        return True
+    return bool(_CJK_RE.search(str(text)))
 
 
 def remove_korean_fillers(text: str) -> str:

@@ -13,25 +13,29 @@ class TranslatorUI:
         state: SharedState,
         on_change_input: Callable[[], None],
         on_change_output: Callable[[], None],
+        on_change_kokoro: Callable[[], None],
         on_close: Callable[[], None],
     ) -> None:
         self.state = state
         self._input_callback = on_change_input
         self._output_callback = on_change_output
+        self._kokoro_callback = on_change_kokoro
         self._close_callback = on_close
 
         self.root = tk.Tk()
         self.root.title("Realtime Translator")
-        self.root.geometry("420x280")
+        self.root.geometry("420x320")
         self.root.resizable(False, False)
         self.root.protocol("WM_DELETE_WINDOW", self._handle_close)
 
-        self._language_labels: Dict[str, str] = {key: label for key, label in LANGUAGE_OPTIONS}
+        self._language_labels: Dict[str, str] = {option.code: option.label for option in LANGUAGE_OPTIONS}
+        self._language_codes: Dict[str, str] = {option.label: option.code for option in LANGUAGE_OPTIONS}
         self._preset_labels: Dict[str, str] = {preset.key: preset.label for preset in PRESETS.values()}
 
         self.input_label_var = tk.StringVar(value="")
         self.output_label_var = tk.StringVar(value="")
-        self.language_var = tk.StringVar(value=self._language_labels.get("ko", "한국어"))
+        self.kokoro_label_var = tk.StringVar(value="")
+        self.language_var = tk.StringVar(value=self._language_labels.get("ko", "한국어 → EN"))
         self.preset_var = tk.StringVar(value=self._preset_labels.get("latency", "지연 우선"))
         self.latency_value_var = tk.StringVar(value="0 ms")
 
@@ -59,6 +63,12 @@ class TranslatorUI:
         )
         ttk.Button(device_frame, text="변경", command=self._handle_output_change).grid(row=1, column=2, pady=(6, 0))
 
+        ttk.Label(device_frame, text="Kokoro 출력").grid(row=2, column=0, pady=(6, 0), sticky="w")
+        ttk.Label(device_frame, textvariable=self.kokoro_label_var, width=28).grid(
+            row=2, column=1, padx=(12, 8), pady=(6, 0), sticky="w"
+        )
+        ttk.Button(device_frame, text="변경", command=self._handle_kokoro_change).grid(row=2, column=2, pady=(6, 0))
+
         # Language selection
         lang_frame = ttk.LabelFrame(frame, text="언어 고정", padding=(12, 8))
         lang_frame.pack(fill="x", pady=(0, 12))
@@ -66,7 +76,7 @@ class TranslatorUI:
         lang_box = ttk.Combobox(
             lang_frame,
             textvariable=self.language_var,
-            values=[label for _, label in LANGUAGE_OPTIONS],
+            values=[option.label for option in LANGUAGE_OPTIONS],
             state="readonly",
             width=18,
         )
@@ -99,10 +109,9 @@ class TranslatorUI:
     # ------------------------------------------------------------------
     def _on_language_selected(self, _event: object) -> None:
         label = self.language_var.get()
-        for key, display in self._language_labels.items():
-            if display == label:
-                self.state.request_language(key)
-                return
+        code = self._language_codes.get(label)
+        if code:
+            self.state.request_language(code)
 
     def _on_preset_changed(self) -> None:
         label = self.preset_var.get()
@@ -117,6 +126,9 @@ class TranslatorUI:
     def _handle_output_change(self) -> None:
         self._output_callback()
 
+    def _handle_kokoro_change(self) -> None:
+        self._kokoro_callback()
+
     def _handle_close(self) -> None:
         self._close_callback()
         self.root.destroy()
@@ -128,6 +140,7 @@ class TranslatorUI:
         snap = self.state.snapshot()
         self.input_label_var.set(snap.get("input_label", ""))
         self.output_label_var.set(snap.get("output_label", ""))
+        self.kokoro_label_var.set(snap.get("kokoro_label", ""))
         latency = float(snap.get("latency_ms", 0.0))
         self.latency_bar["value"] = max(0.0, min(latency, float(self.latency_bar["maximum"])))
         self.latency_value_var.set(f"{latency:.0f} ms")

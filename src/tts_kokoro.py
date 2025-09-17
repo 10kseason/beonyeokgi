@@ -517,6 +517,30 @@ class KokoroTTS:
                 state.tail = np.zeros(0, dtype=np.float32)
             self._play_states.clear()
 
+    def set_passthrough_device(self, device: Optional[object]) -> None:
+        """Update the optional mirror device and release previous resources."""
+
+        normalized = self._normalize_device(device)
+        with self._play_lock:
+            previous = self._normalize_device(self.cfg.passthrough_input_device)
+            if previous == normalized:
+                self.cfg.passthrough_input_device = normalized
+                return
+            if previous is not None:
+                prev_key = self._device_key(previous)
+                state = self._play_states.pop(prev_key, None)
+                if state is not None:
+                    if state.timer is not None:
+                        state.timer.cancel()
+                        state.timer = None
+                    if state.stream is not None:
+                        try:
+                            state.stream.stop()
+                            state.stream.close()
+                        except Exception:
+                            logger.debug("Closing Kokoro passthrough stream failed", exc_info=True)
+            self.cfg.passthrough_input_device = normalized
+
     def _schedule_tail_flush(self, device_key: str, state: PlaybackState) -> None:
         if state.timer is not None:
             state.timer.cancel()

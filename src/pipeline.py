@@ -8,23 +8,36 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from queue import Empty
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from .audio_io import MicReader
 from .asr import ASR
 from .preprocess import AudioPreprocessor
 from .tts_kokoro import KokoroTTS
-from .utils import contains_hangul, parse_sd_device
+from .utils import contains_cjk, parse_sd_device
 from .vad import VADSegmenter
 from .voice_changer_client import VoiceChangerClient, VoiceChangerConfig
 
 
 logger = logging.getLogger("vc-translator.pipeline")
 
-LANGUAGE_OPTIONS: Sequence[Tuple[str, str]] = (
-    ("ko", "한국어"),
-    ("ja", "일본어"),
-    ("zh", "중국어"),
+try:  # Optional dependency for explicit translation fallback
+    from .translator import get_translator
+except Exception:  # pragma: no cover - optional dependency
+    get_translator = None  # type: ignore
+
+
+@dataclass(frozen=True)
+class LanguageOption:
+    code: str
+    label: str
+    target: str
+
+
+LANGUAGE_OPTIONS: Sequence[LanguageOption] = (
+    LanguageOption("ko", "한국어 → EN", "en"),
+    LanguageOption("ja", "일본어 → EN", "en"),
+    LanguageOption("zh", "중국어 → EN", "en"),
 )
 
 
@@ -70,6 +83,8 @@ class SharedState:
         output_device: Optional[object],
         input_label: str,
         output_label: str,
+        kokoro_device: Optional[object],
+        kokoro_label: str,
     ) -> None:
         self._lock = threading.Lock()
         self._requested_language = language
@@ -82,6 +97,9 @@ class SharedState:
         self._active_output_device = output_device
         self._input_label = input_label or ""
         self._output_label = output_label or ""
+        self._requested_kokoro_device = kokoro_device
+        self._active_kokoro_device = kokoro_device
+        self._kokoro_label = kokoro_label or ""
         self._generation = 0
         self.latency_ms = 0.0
 
@@ -114,6 +132,13 @@ class SharedState:
                 self._generation += 1
             self._output_label = label or ""
 
+    def request_kokoro_device(self, device: Optional[object], label: str) -> None:
+        with self._lock:
+            if device != self._requested_kokoro_device:
+                self._requested_kokoro_device = device
+                self._generation += 1
+            self._kokoro_label = label or ""
+
     # ------------------------------------------------------------------
     # Pipeline thread interactions
     # ------------------------------------------------------------------
@@ -128,6 +153,8 @@ class SharedState:
                 "active_input": self._active_input_device,
                 "requested_output": self._requested_output_device,
                 "active_output": self._active_output_device,
+                "requested_kokoro": self._requested_kokoro_device,
+                "active_kokoro": self._active_kokoro_device,
                 "generation": self._generation,
             }
 
@@ -147,16 +174,23 @@ class SharedState:
         with self._lock:
             self._active_output_device = device
 
+    def set_active_kokoro_device(self, device: Optional[object]) -> None:
+        with self._lock:
+            self._active_kokoro_device = device
+
     def set_labels(
         self,
         input_label: Optional[str] = None,
         output_label: Optional[str] = None,
+        kokoro_label: Optional[str] = None,
     ) -> None:
         with self._lock:
             if input_label is not None:
                 self._input_label = input_label
             if output_label is not None:
                 self._output_label = output_label
+            if kokoro_label is not None:
+                self._kokoro_label = kokoro_label
 
     def update_latency(self, latency_ms: float) -> None:
         with self._lock:
@@ -170,6 +204,7 @@ class SharedState:
                 "latency_ms": self.latency_ms,
                 "input_label": self._input_label,
                 "output_label": self._output_label,
+                "kokoro_label": self._kokoro_label,
             }
 
     def get_active_language(self) -> str:
@@ -188,6 +223,9 @@ class SharedState:
         with self._lock:
             return self._active_output_device
 
+    def get_active_kokoro_device(self) -> Optional[object]:
+        with self._lock:
+            return self._active_kokoro_device
 
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+")
 
@@ -205,7 +243,7 @@ class TranslatorPipeline:
         self,
         cfg: Dict[str, Any],
         state: SharedState,
-        save_devices: Callable[[Optional[object], Optional[object]], None],
+        save_devices: Callable[[Optional[object], Optional[object], Optional[object]], None],
     ) -> None:
         self.cfg = cfg
         self.state = state
@@ -219,6 +257,9 @@ class TranslatorPipeline:
         self._latency_history: deque[float] = deque(maxlen=50)
         self._current_input_device = state.get_active_input_device()
         self._current_output_device = state.get_active_output_device()
+        self._current_kokoro_device = state.get_active_kokoro_device()
+        self._translator_cache: Dict[str, Optional[Any]] = {}
+        self._language_targets = {option.code: option.target for option in LANGUAGE_OPTIONS}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -256,12 +297,15 @@ class TranslatorPipeline:
     async def _run_async(self) -> None:
         self._loop = asyncio.get_running_loop()
         device_cfg = self.cfg.get("device", {}) or {}
+        kokoro_cfg = self.cfg.get("kokoro", {}) or {}
         input_sr = int(device_cfg.get("input_samplerate") or 48000)
         output_sr = int(device_cfg.get("output_samplerate") or 48000)
         input_device = device_cfg.get("input_device")
         output_device = device_cfg.get("output_device")
+        kokoro_passthrough = kokoro_cfg.get("passthrough_input_device")
         self._current_input_device = input_device
         self._current_output_device = output_device
+        self._current_kokoro_device = kokoro_passthrough
 
         preset_key = self.state.get_active_preset()
         preset = PRESETS.get(preset_key, PRESETS["latency"])
@@ -305,7 +349,6 @@ class TranslatorPipeline:
         vc_client = self._create_voice_changer()
         self._voice_changer = vc_client
 
-        kokoro_cfg = self.cfg.get("kokoro", {}) or {}
         tts = KokoroTTS(
             model=kokoro_cfg.get("model", "hexgrad/Kokoro-82M"),
             speaker=str(kokoro_cfg.get("speaker", "") or ""),
@@ -319,7 +362,7 @@ class TranslatorPipeline:
             volume_db=float(self.cfg.get("tts", {}).get("volume_db", 0.0) or 0.0),
             out_sr=output_sr,
             output_device=output_device,
-            passthrough_input_device=kokoro_cfg.get("passthrough_input_device"),
+            passthrough_input_device=kokoro_passthrough,
             voice_changer=vc_client,
             short_threshold_ms=float(kokoro_cfg.get("short_threshold_ms", 500.0)),
             min_batch_ms=float(kokoro_cfg.get("min_batch_ms", 900.0)),
@@ -332,6 +375,7 @@ class TranslatorPipeline:
             warmup_runs=int(kokoro_cfg.get("warmup_runs", 2)),
         )
         self._tts = tts
+        self.state.set_active_kokoro_device(kokoro_passthrough)
 
         try:
             mic.start()
@@ -395,12 +439,16 @@ class TranslatorPipeline:
             sentences = [text]
         per_sentence_ms = segment_ms / len(sentences) if segment_ms > 0 and sentences else None
         tts_elapsed_total = 0.0
+        active_language = self.state.get_active_language()
         for sentence in sentences:
             sentence = sentence.strip()
             if not sentence:
                 continue
-            if contains_hangul(sentence):
-                logger.info("Skipping TTS because text contains Hangul: %s", sentence)
+            sentence = self._ensure_english_text(sentence, active_language)
+            if not sentence:
+                continue
+            if self._should_skip_non_english(sentence, active_language):
+                logger.info("Skipping TTS because text is not English after translation: %s", sentence)
                 continue
             speak_start = time.perf_counter()
             try:
@@ -413,6 +461,50 @@ class TranslatorPipeline:
         self._latency_history.append(total_latency)
         avg_latency = sum(self._latency_history) / len(self._latency_history)
         self.state.update_latency(avg_latency)
+
+    def _normalize_language(self, language: Optional[str]) -> str:
+        if not language:
+            return ""
+        return str(language).split("-")[0].lower()
+
+    def _get_translator(self, language: str):
+        if get_translator is None:
+            return None
+        if language in self._translator_cache:
+            return self._translator_cache[language]
+        try:
+            translator = get_translator(language)
+        except Exception:
+            logger.warning("Failed to initialize translator for %s", language, exc_info=True)
+            translator = None
+        self._translator_cache[language] = translator
+        return translator
+
+    def _ensure_english_text(self, text: str, language: Optional[str]) -> str:
+        normalized = self._normalize_language(language)
+        if not normalized:
+            return text
+        target = self._language_targets.get(normalized)
+        if target != "en":
+            return text
+        if not contains_cjk(text):
+            return text
+        translator = self._get_translator(normalized)
+        if translator is None:
+            return text
+        try:
+            translated = translator.translate(text)
+        except Exception:
+            logger.warning("Translator %s→en failed", normalized, exc_info=True)
+            return text
+        return translated or text
+
+    def _should_skip_non_english(self, text: str, language: Optional[str]) -> bool:
+        normalized = self._normalize_language(language)
+        target = self._language_targets.get(normalized)
+        if target != "en":
+            return False
+        return contains_cjk(text)
 
     def _apply_configuration(self, vad: VADSegmenter, asr: ASR, tts: KokoroTTS) -> None:
         cfg = self.state.get_configuration()
@@ -432,6 +524,8 @@ class TranslatorPipeline:
             self._switch_input_device(cfg["requested_input"])
         if cfg["requested_output"] != cfg["active_output"]:
             self._switch_output_device(cfg["requested_output"], tts)
+        if cfg["requested_kokoro"] != cfg["active_kokoro"]:
+            self._switch_kokoro_passthrough(cfg["requested_kokoro"], tts)
 
     def _switch_input_device(self, device: Optional[object]) -> None:
         parsed = parse_sd_device(device)
@@ -455,9 +549,25 @@ class TranslatorPipeline:
         self.state.set_active_output_device(device)
         self._persist_devices()
 
+    def _switch_kokoro_passthrough(self, device: Optional[object], tts: KokoroTTS) -> None:
+        parsed = parse_sd_device(device)
+        self._current_kokoro_device = parsed
+        self.cfg.setdefault("kokoro", {})["passthrough_input_device"] = parsed
+        if hasattr(tts, "set_passthrough_device"):
+            try:
+                tts.set_passthrough_device(parsed)
+            except Exception:
+                logger.debug("Failed to switch Kokoro passthrough device", exc_info=True)
+        self.state.set_active_kokoro_device(device)
+        self._persist_devices()
+
     def _persist_devices(self) -> None:
         try:
-            self._save_devices(self._current_input_device, self._current_output_device)
+            self._save_devices(
+                self._current_input_device,
+                self._current_output_device,
+                self._current_kokoro_device,
+            )
         except Exception:
             logger.debug("Failed to persist devices", exc_info=True)
 
