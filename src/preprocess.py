@@ -4,10 +4,17 @@ import math
 from dataclasses import dataclass
 from typing import Tuple
 
+import logging
+import shutil
+import subprocess
+
 import numpy as np
 import pyloudnorm as pyln
 
 from .utils import float32_to_int16, int16_to_float32, resample_audio
+
+
+logger = logging.getLogger(__name__)
 
 
 class _BiquadFilter:
@@ -98,6 +105,9 @@ class AudioPreprocessor:
         self._lowpass = _BiquadFilter("lowpass", lowpass_hz, self.target_sr)
         self._loudnorm = loudnorm or LoudnormConfig()
         self._meter = pyln.Meter(self.target_sr)
+        self._ffmpeg_path = shutil.which("ffmpeg")
+        self._ffmpeg_disabled = False
+        self._ffmpeg_warned = False
 
     def reset(self) -> None:
         self._highpass.reset()
@@ -109,8 +119,13 @@ class AudioPreprocessor:
         samples_i16 = np.frombuffer(pcm_bytes, dtype=np.int16)
         if samples_i16.size == 0:
             return pcm_bytes, self.target_sr
-        audio = int16_to_float32(samples_i16)
         sr = int(input_sr) if int(input_sr) > 0 else self.target_sr
+        if sr != self.target_sr:
+            converted = self._try_ffmpeg_resample(samples_i16, sr)
+            if converted is not None:
+                samples_i16 = converted
+                sr = self.target_sr
+        audio = int16_to_float32(samples_i16)
         if sr != self.target_sr:
             audio = resample_audio(audio, sr, self.target_sr)
             sr = self.target_sr
@@ -119,6 +134,64 @@ class AudioPreprocessor:
         normalized = self._apply_loudnorm(filtered)
         out = float32_to_int16(normalized)
         return out.tobytes(), sr
+
+    def _try_ffmpeg_resample(self, samples: np.ndarray, src_sr: int) -> np.ndarray | None:
+        if self._ffmpeg_disabled or self._ffmpeg_path is None:
+            return None
+        if src_sr <= 0 or src_sr == self.target_sr:
+            return None
+        cmd = [
+            self._ffmpeg_path,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "s16le",
+            "-ac",
+            "1",
+            "-ar",
+            str(int(src_sr)),
+            "-i",
+            "pipe:0",
+            "-f",
+            "s16le",
+            "-ac",
+            "1",
+            "-ar",
+            str(self.target_sr),
+            "pipe:1",
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                input=samples.tobytes(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+            )
+        except FileNotFoundError:
+            if not self._ffmpeg_warned:
+                logger.warning("ffmpeg executable not found; falling back to internal resampler")
+                self._ffmpeg_warned = True
+            self._ffmpeg_disabled = True
+            return None
+        except subprocess.CalledProcessError as exc:
+            if not self._ffmpeg_warned:
+                err_output = exc.stderr.decode(errors="ignore").strip()
+                if err_output:
+                    logger.warning("ffmpeg resample failed: %s", err_output)
+                else:
+                    logger.warning("ffmpeg resample failed with exit code %s", exc.returncode)
+                self._ffmpeg_warned = True
+            self._ffmpeg_disabled = True
+            return None
+        output = result.stdout
+        if not output:
+            if not self._ffmpeg_warned:
+                logger.warning("ffmpeg produced no output during resample; using internal resampler")
+                self._ffmpeg_warned = True
+            return None
+        return np.frombuffer(output, dtype=np.int16)
 
     # ------------------------------------------------------------------
     # Loudness helpers

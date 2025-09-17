@@ -319,6 +319,7 @@ class TranslatorPipeline:
             volume_db=float(self.cfg.get("tts", {}).get("volume_db", 0.0) or 0.0),
             out_sr=output_sr,
             output_device=output_device,
+            passthrough_input_device=kokoro_cfg.get("passthrough_input_device"),
             voice_changer=vc_client,
             short_threshold_ms=float(kokoro_cfg.get("short_threshold_ms", 500.0)),
             min_batch_ms=float(kokoro_cfg.get("min_batch_ms", 900.0)),

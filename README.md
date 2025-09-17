@@ -62,6 +62,7 @@ Kokoro 82M GPU TTS
   - NVIDIA GPUs stick to PyTorch + CUDA (`use_half = true` keeps FP16 inference).
   - AMD on Linux prefers ONNX + ROCm; Windows systems without NVIDIA prefer ONNX + DirectML.
   - CPU-only mode is kept as a final fallback when no GPU runtime is available.
+- Mirror Kokoro playback to a virtual microphone by setting `[kokoro].passthrough_input_device` to the input device index/name (e.g. the 3rd input device). Audio continues to play on the main output while also feeding the specified input.
 - To pin a specific configuration, override `[kokoro].backend`, `[kokoro].device`, or `[kokoro].onnx_providers` and rerun. CLI overrides such as `--kokoro-backend onnx` or `--kokoro-provider DmlExecutionProvider` are still supported.
 - Built-in queueing keeps playback smooth: sentences are batched until the group reaches roughly 0.8–1.2 s, a fixed 120 ms crossfade blends consecutive utterances, and short clips flush automatically when speech pauses. The tunables (`short_threshold_ms`, `min_batch_ms`, `max_batch_ms`, `crossfade_ms`, etc.) live under `[kokoro]` if you need to tweak them.
 - Kokoro playback is skipped automatically if Whisper returns Korean (non-translated) text, preventing Korean sentences from being spoken in the English voice.
