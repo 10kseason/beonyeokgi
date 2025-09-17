@@ -56,7 +56,7 @@ mode = "chunk"
 normalize_dbfs = -16
 
 [voice_changer]
-enabled = true
+enabled = false
 base_url = "http://localhost:18000"
 endpoint = "/api/voice-changer/convert_chunk"
 input_sample_rate = 0
