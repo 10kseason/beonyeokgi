@@ -13,6 +13,12 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional,
 import numpy as np
 import sounddevice as sd
 
+try:  # pragma: no cover - optional dependency
+    from huggingface_hub.utils import EntryNotFoundError, LocalEntryNotFoundError
+except Exception:  # pragma: no cover - optional dependency
+    EntryNotFoundError = None  # type: ignore
+    LocalEntryNotFoundError = None  # type: ignore
+
 from .utils import float32_to_int16, parse_sd_device, resample_audio
 
 try:  # Optional dependency used when available
@@ -25,6 +31,39 @@ if TYPE_CHECKING:  # pragma: no cover
 
 
 logger = logging.getLogger("vc-translator.tts.kokoro")
+
+
+_MISSING_MODEL_ERROR_TYPES: Tuple[type[BaseException], ...] = (FileNotFoundError, OSError)
+_missing_extra: List[type[BaseException]] = []
+if EntryNotFoundError is not None:
+    _missing_extra.append(EntryNotFoundError)  # type: ignore[arg-type]
+if LocalEntryNotFoundError is not None:
+    _missing_extra.append(LocalEntryNotFoundError)  # type: ignore[arg-type]
+if _missing_extra:
+    _MISSING_MODEL_ERROR_TYPES = _MISSING_MODEL_ERROR_TYPES + tuple(_missing_extra)
+
+_MISSING_MODEL_KEYWORDS: Tuple[str, ...] = (
+    "not found",
+    "no such file",
+    "missing model",
+    "download the model",
+    "download the models",
+    "models have not been downloaded",
+    "cannot find",
+)
+
+
+def _is_missing_model_error(exc: BaseException) -> bool:
+    if isinstance(exc, _MISSING_MODEL_ERROR_TYPES):
+        return True
+    message = str(exc).lower()
+    return any(keyword in message for keyword in _MISSING_MODEL_KEYWORDS)
+
+
+class MissingKokoroModelError(RuntimeError):
+    def __init__(self, model: str, message: str) -> None:
+        super().__init__(message)
+        self.model = model
 
 
 @dataclass
@@ -270,10 +309,18 @@ class KokoroTTS:
         return float(min(max(estimate, 300.0), 4000.0))
 
     def _synthesize_and_play(self, text: str) -> Optional[bool]:
-        runtime = self._ensure_runtime()
+        try:
+            runtime = self._ensure_runtime()
+        except MissingKokoroModelError:
+            raise
+        except Exception as exc:
+            logger.error("Failed to initialize Kokoro runtime: %s", exc)
+            return None
         synth_start = time.perf_counter()
         try:
             audio_f32, sample_rate = runtime(text)
+        except MissingKokoroModelError:
+            raise
         except Exception as exc:
             logger.error("Kokoro synthesis failed: %s", exc)
             return None
@@ -608,6 +655,8 @@ class KokoroTTS:
         for plan in plans:
             try:
                 runtime, latency = self._benchmark_plan(plan)
+            except MissingKokoroModelError:
+                raise
             except Exception as exc:
                 logger.warning("Skipping Kokoro backend %s: %s", plan.label or plan.backend, exc)
                 continue
@@ -793,10 +842,15 @@ class KokoroTTS:
         for _ in range(warmup_runs):
             try:
                 runtime(self._probe_text)
+            except MissingKokoroModelError:
+                raise
             except Exception:
                 break
         start = time.perf_counter()
-        runtime(self._probe_text)
+        try:
+            runtime(self._probe_text)
+        except MissingKokoroModelError:
+            raise
         elapsed = time.perf_counter() - start
         return runtime, elapsed
 
@@ -814,6 +868,8 @@ class KokoroTTS:
         plan = self._plans[self._active_plan_idx]
         try:
             runtime = plan.runtime or self._build_runtime_for_plan(plan, persist=True)
+        except MissingKokoroModelError:
+            raise
         except Exception as exc:
             logger.error("Failed to switch Kokoro backend to %s: %s", plan.label or plan.backend, exc)
             return False
@@ -974,12 +1030,29 @@ class KokoroTTS:
                 return True
         return False
 
+    def _raise_missing_model(self, model: str, exc: BaseException) -> None:
+        message = (
+            f"Kokoro 모델 '{model}'을 찾을 수 없습니다.\n\n"
+            "명령 프롬프트(또는 PowerShell)에서 아래 명령으로 모델을 다운로드한 뒤 다시 실행해 주세요.\n"
+            f"kokoro download \"{model}\"\n\n세부 정보: {exc}"
+        )
+        raise MissingKokoroModelError(model, message) from exc
+
     def _invoke_loader(self, loader: Callable[..., Any], model: str, **kwargs: Any) -> Any:
         try:
             filtered = {k: v for k, v in kwargs.items() if self._supports_kw(loader, k)}
             return loader(model, **filtered)
         except TypeError:
-            return loader(model)
+            try:
+                return loader(model)
+            except Exception as exc:
+                if _is_missing_model_error(exc):
+                    self._raise_missing_model(model, exc)
+                raise
+        except Exception as exc:
+            if _is_missing_model_error(exc):
+                self._raise_missing_model(model, exc)
+            raise
 
     def _invoke_onnx_loader(self, loader: Callable[..., Any], model: str, providers: Sequence[str]) -> Any:
         kwargs: dict[str, Any] = {}
@@ -992,7 +1065,16 @@ class KokoroTTS:
         try:
             return loader(model, **kwargs)
         except TypeError:
-            return loader(model)
+            try:
+                return loader(model)
+            except Exception as exc:
+                if _is_missing_model_error(exc):
+                    self._raise_missing_model(model, exc)
+                raise
+        except Exception as exc:
+            if _is_missing_model_error(exc):
+                self._raise_missing_model(model, exc)
+            raise
 
     def _load_voice(self, module: Any, speaker: str) -> Any:
         if not speaker:

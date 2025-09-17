@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import tkinter as tk
-from tkinter import ttk
+from tkinter import messagebox, ttk
 from typing import Callable, Dict
 
 from .pipeline import LANGUAGE_OPTIONS, PRESETS, SharedState
@@ -152,6 +152,15 @@ class TranslatorUI:
         preset_label = self._preset_labels.get(snap.get("preset", "latency"), self.preset_var.get())
         if self.preset_var.get() != preset_label:
             self.preset_var.set(preset_label)
+
+        while True:
+            alert = self.state.pop_alert()
+            if alert is None:
+                break
+            try:
+                messagebox.showerror("Kokoro 모델 다운로드 필요", alert)
+            except Exception:
+                print(alert)
 
         self.root.after(200, self._refresh)
 
