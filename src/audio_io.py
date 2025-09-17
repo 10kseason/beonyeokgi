@@ -64,6 +64,17 @@ class MicReader:
                 self.stream.close()
                 self.stream = None
 
+    def restart(self, input_device: Optional[str] = None) -> None:
+        """Restart the input stream with a new device if provided."""
+
+        was_running = self.stream is not None
+        self.stop()
+        if input_device is not None:
+            self.input_device = input_device
+        self.q = queue.Queue(maxsize=64)
+        if was_running:
+            self.start()
+
 
 def play_pcm_int16(samples: np.ndarray, samplerate: int, output_device: Optional[str] = None):
     """

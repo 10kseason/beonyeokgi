@@ -441,6 +441,25 @@ class KokoroTTS:
             if state.tail.size > 0 and self._tail_flush_delay > 0.0:
                 self._schedule_tail_flush(device_key, state)
 
+    def set_output_device(self, device: Optional[object]) -> None:
+        """Update the playback device and reset active streams."""
+
+        with self._play_lock:
+            self.cfg.output_device = device
+            for state in self._play_states.values():
+                if state.timer is not None:
+                    state.timer.cancel()
+                    state.timer = None
+                if state.stream is not None:
+                    try:
+                        state.stream.stop()
+                        state.stream.close()
+                    except Exception:
+                        logger.debug("Closing Kokoro stream after device change failed", exc_info=True)
+                state.stream = None
+                state.tail = np.zeros(0, dtype=np.float32)
+            self._play_states.clear()
+
     def _schedule_tail_flush(self, device_key: str, state: PlaybackState) -> None:
         if state.timer is not None:
             state.timer.cancel()
