@@ -4,3 +4,6 @@ output_device = 10
 
 [app]
 compute_mode = "cpu"
+
+[translator]
+use_llm = true

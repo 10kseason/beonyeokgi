@@ -502,6 +502,7 @@ class TranslatorPipeline:
             beam_size=preset.beam_size,
             input_sr=preproc.target_sr,
             temperature=preset.temperature,
+            condition_on_previous_text=bool(asr_cfg.get("condition_on_previous_text", True)),
         )
         asr.set_force_transcribe(self.state.get_llm_translate_active())
         self.state.set_active_language(asr_cfg.get("language", "ko"))
@@ -534,6 +535,13 @@ class TranslatorPipeline:
             tail_flush_ms=float(kokoro_cfg.get("tail_flush_ms", 350.0)),
             short_idle_flush_ms=float(kokoro_cfg.get("short_idle_flush_ms", 650.0)),
             warmup_runs=int(kokoro_cfg.get("warmup_runs", 2)),
+            dynamic_pace=bool(kokoro_cfg.get("dynamic_pace", True)),
+            dynamic_pace_min=float(kokoro_cfg.get("dynamic_pace_min", 0.35)),
+            dynamic_pace_max=float(kokoro_cfg.get("dynamic_pace_max", 1.8)),
+            dynamic_pace_tolerance=float(kokoro_cfg.get("dynamic_pace_tolerance", 0.12)),
+            dynamic_min_target_ms=float(kokoro_cfg.get("dynamic_min_target_ms", 750.0)),
+            dynamic_max_target_ms=float(kokoro_cfg.get("dynamic_max_target_ms", 20000.0)),
+            estimate_max_ms=float(kokoro_cfg.get("estimate_max_ms", kokoro_cfg.get("max_estimate_ms", 20000.0))),
         )
         self._tts = tts
         self.state.set_active_kokoro_device(kokoro_passthrough)

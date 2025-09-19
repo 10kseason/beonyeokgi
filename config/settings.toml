@@ -10,21 +10,21 @@ device = "cuda"
 compute_type = "int8"
 task = "translate"
 language = "ko"
-beam_size = 3
-temperature = 0.0
+beam_size = 2
+condition_on_previous_text = false
 vad = true
 
 [vad]
-frame_ms = 30
-aggressiveness = 3
-min_speech_sec = 0.30
-silence_pad_ms = 400
+frame_ms = 20
+aggressiveness = 1
+min_speech_sec = 0.18
+silence_pad_ms = 320
 max_segment_ms = 9000
 chunk_enable = false
 # ---- Forced Segmentation (when VAD misses speech) ----
 [vad.force]
 enable = true
-rms_speech_threshold_dbfs = -33.0  # >= this is considered speech-like
+rms_speech_threshold_dbfs = -26.5  # >= this is considered speech-like
 min_forced_segment_ms = 2000      # minimum duration to cut on loud->quiet
 sustained_loud_ms = 7000          # force if loud this long with no VAD end
 max_buffer_ms = 20000             # cap buffer
@@ -35,7 +35,7 @@ engine = "kokoro"
 voice = "en-US-AriaNeural"
 piper_model = ""
 pace = 1.0
-volume_db = 13.4
+volume_db = 10.4
 
 [kokoro]
 model = "hexgrad/Kokoro-82M"
@@ -56,6 +56,13 @@ crossfade_ms = 120.0
 tail_flush_ms = 320.0
 short_idle_flush_ms = 500.0
 warmup_runs = 2
+dynamic_pace = true
+dynamic_pace_min = 0.35
+dynamic_pace_max = 1.8
+dynamic_pace_tolerance = 0.12
+dynamic_min_target_ms = 750.0
+dynamic_max_target_ms = 20000.0
+estimate_max_ms = 20000.0
 
 [app]
 preset = "accuracy"
@@ -94,4 +101,6 @@ stream_chunk_ms = 1000
 
 [logging]
 level = "INFO"
+
+
 

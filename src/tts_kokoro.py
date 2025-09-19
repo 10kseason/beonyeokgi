@@ -53,6 +53,13 @@ class KokoroConfig:
     tail_flush_ms: float = 350.0
     short_idle_flush_ms: float = 650.0
     warmup_runs: int = 2
+    dynamic_pace: bool = True
+    dynamic_pace_min: float = 0.35
+    dynamic_pace_max: float = 1.8
+    dynamic_pace_tolerance: float = 0.12
+    dynamic_min_target_ms: float = 750.0
+    dynamic_max_target_ms: float = 20000.0
+    estimate_max_ms: float = 20000.0
 
 
 @dataclass
@@ -145,6 +152,13 @@ class KokoroTTS:
         tail_flush_ms: float = 350.0,
         short_idle_flush_ms: float = 650.0,
         warmup_runs: int = 2,
+        dynamic_pace: bool = True,
+        dynamic_pace_min: float = 0.35,
+        dynamic_pace_max: float = 1.8,
+        dynamic_pace_tolerance: float = 0.12,
+        dynamic_min_target_ms: float = 750.0,
+        dynamic_max_target_ms: float = 20000.0,
+        estimate_max_ms: float = 20000.0,
     ) -> None:
         backend_value = str(backend).lower()
         device_value = str(device).lower() if isinstance(device, str) else device
@@ -174,6 +188,13 @@ class KokoroTTS:
             tail_flush_ms=float(tail_flush_ms),
             short_idle_flush_ms=float(short_idle_flush_ms),
             warmup_runs=int(warmup_runs),
+            dynamic_pace=bool(dynamic_pace),
+            dynamic_pace_min=float(dynamic_pace_min),
+            dynamic_pace_max=float(dynamic_pace_max),
+            dynamic_pace_tolerance=float(dynamic_pace_tolerance),
+            dynamic_min_target_ms=float(dynamic_min_target_ms),
+            dynamic_max_target_ms=float(dynamic_max_target_ms),
+            estimate_max_ms=float(estimate_max_ms),
         )
         self.cfg.short_threshold_ms = max(0.0, self.cfg.short_threshold_ms)
         self.cfg.min_batch_ms = max(0.0, self.cfg.min_batch_ms)
@@ -184,6 +205,17 @@ class KokoroTTS:
         self.cfg.tail_flush_ms = max(50.0, self.cfg.tail_flush_ms)
         self.cfg.short_idle_flush_ms = max(0.0, self.cfg.short_idle_flush_ms)
         self.cfg.warmup_runs = max(0, int(self.cfg.warmup_runs))
+        self.cfg.dynamic_pace = bool(self.cfg.dynamic_pace)
+        self.cfg.dynamic_pace_min = max(0.1, float(self.cfg.dynamic_pace_min))
+        self.cfg.dynamic_pace_max = max(self.cfg.dynamic_pace_min, float(self.cfg.dynamic_pace_max))
+        self.cfg.dynamic_pace_tolerance = max(0.0, float(self.cfg.dynamic_pace_tolerance))
+        self.cfg.dynamic_min_target_ms = max(0.0, float(self.cfg.dynamic_min_target_ms))
+        self.cfg.dynamic_max_target_ms = max(0.0, float(self.cfg.dynamic_max_target_ms))
+        if self.cfg.dynamic_max_target_ms > 0.0 and self.cfg.dynamic_min_target_ms > self.cfg.dynamic_max_target_ms:
+            self.cfg.dynamic_max_target_ms = self.cfg.dynamic_min_target_ms
+        self.cfg.estimate_max_ms = max(0.0, float(self.cfg.estimate_max_ms))
+        if self.cfg.dynamic_max_target_ms > 0.0 and self.cfg.estimate_max_ms > self.cfg.dynamic_max_target_ms:
+            self.cfg.estimate_max_ms = self.cfg.dynamic_max_target_ms
         self.voice_changer = voice_changer
         self._runtime: Optional[Callable[[str], Tuple[np.ndarray, int]]] = None
         self._auto_backend = self.cfg.backend == "auto" or (
@@ -202,6 +234,8 @@ class KokoroTTS:
         self._tail_flush_delay = self.cfg.tail_flush_ms / 1000.0
         self._short_idle_threshold = self.cfg.short_idle_flush_ms / 1000.0
         self._probe_text = DEFAULT_PROBE_TEXT
+        self._pending_target_ms: Optional[float] = None
+        self._last_dynamic_pace: Optional[float] = None
 
         self.cfg.output_device = self._normalize_device(self.cfg.output_device)
         self.cfg.passthrough_input_device = self._normalize_device(
@@ -242,7 +276,7 @@ class KokoroTTS:
         if self._short_segments:
             result = self._flush_short_buffer(force=True)
 
-        playback_result = self._synthesize_and_play(clean_text)
+        playback_result = self._synthesize_and_play(clean_text, target_duration_ms=duration_ms)
         return playback_result if playback_result is not None else result
 
     def flush(self) -> None:
@@ -272,21 +306,72 @@ class KokoroTTS:
         self._short_segments.clear()
         self._short_accum_ms = 0.0
         self._last_short_added = 0.0
-        return self._synthesize_and_play(combined_text)
+        return self._synthesize_and_play(combined_text, target_duration_ms=total_ms)
 
     def _estimate_duration_ms(self, text: str) -> float:
-        words = max(1, len(text.split()))
-        estimate = words * 320.0  # ~187 wpm
-        return float(min(max(estimate, 300.0), 4000.0))
+        stripped = text.strip()
+        if not stripped:
+            return 0.0
+        tokens = [token for token in stripped.split() if token]
+        words = len(tokens)
+        estimate = max(words, 1) * 320.0  # ~187 wpm baseline
+        dense_chars = len("".join(tokens)) if tokens else len(stripped.replace(" ", ""))
+        if dense_chars:
+            estimate = max(estimate, dense_chars * 45.0)
+        estimate = max(estimate, 240.0)
+        max_cap = getattr(self.cfg, "estimate_max_ms", 0.0)
+        if max_cap > 0.0:
+            estimate = min(estimate, max_cap)
+        return float(estimate)
 
-    def _synthesize_and_play(self, text: str) -> Optional[bool]:
+    def _resolve_dynamic_pace(self, text: str) -> float:
+        base_pace = max(0.1, float(self.cfg.pace))
+        target_ms = self._pending_target_ms
+        if not getattr(self.cfg, "dynamic_pace", False) or target_ms is None or target_ms <= 0.0:
+            self._last_dynamic_pace = base_pace
+            return base_pace
+        if self.cfg.dynamic_min_target_ms > 0.0 and target_ms < self.cfg.dynamic_min_target_ms:
+            self._last_dynamic_pace = base_pace
+            return base_pace
+        if self.cfg.dynamic_max_target_ms > 0.0:
+            target_ms = min(target_ms, self.cfg.dynamic_max_target_ms)
+        estimated_ms = self._estimate_duration_ms(text)
+        estimated_ms = max(estimated_ms, 1.0)
+        target_ms = max(target_ms, 1.0)
+        ratio = estimated_ms / target_ms
+        tolerance = self.cfg.dynamic_pace_tolerance
+        if tolerance > 0.0 and abs(1.0 - ratio) <= tolerance:
+            self._last_dynamic_pace = base_pace
+            return base_pace
+        pace = base_pace * ratio
+        min_pace = self.cfg.dynamic_pace_min
+        max_pace = self.cfg.dynamic_pace_max
+        pace = max(min_pace, min(max_pace, pace))
+        previous = self._last_dynamic_pace
+        if pace != base_pace and (previous is None or abs(previous - pace) >= 0.01):
+            logger.debug("Kokoro dynamic pace %.2f -> %.2f (target=%.1f ms, est=%.1f ms)", base_pace, pace, target_ms, estimated_ms)
+        self._last_dynamic_pace = pace
+        return pace
+
+    def _synthesize_and_play(self, text: str, target_duration_ms: Optional[float] = None) -> Optional[bool]:
         runtime = self._ensure_runtime()
         synth_start = time.perf_counter()
+        previous_target = self._pending_target_ms
+        target_ms = None
+        if target_duration_ms is not None and target_duration_ms > 0.0:
+            target_ms = float(target_duration_ms)
+            max_target = getattr(self.cfg, "dynamic_max_target_ms", 0.0)
+            if max_target > 0.0:
+                target_ms = min(target_ms, max_target)
+        self._pending_target_ms = target_ms
         try:
-            audio_f32, sample_rate = runtime(text)
-        except Exception as exc:
-            logger.error("Kokoro synthesis failed: %s", exc)
-            return None
+            try:
+                audio_f32, sample_rate = runtime(text)
+            except Exception as exc:
+                logger.error("Kokoro synthesis failed: %s", exc)
+                return None
+        finally:
+            self._pending_target_ms = previous_target
         synth_elapsed = time.perf_counter() - synth_start
         if audio_f32.size == 0 or sample_rate <= 0:
             return None
@@ -907,7 +992,7 @@ class KokoroTTS:
             clean_text = text.strip()
             if not clean_text:
                 return np.zeros(0, dtype=np.float32), sample_rate
-            speed = max(0.1, float(self.cfg.pace))
+            speed = self._resolve_dynamic_pace(clean_text)
             audio_chunks: List[np.ndarray] = []
             with torch.inference_mode():
                 for result in pipeline(clean_text, voice=speaker, speed=speed):
@@ -1023,6 +1108,7 @@ class KokoroTTS:
             if not clean_text:
                 return np.zeros(0, dtype=np.float32), self.cfg.out_sr
             tokens = self._maybe_tokenize(tokenizer, clean_text, voice)
+            pace = self._resolve_dynamic_pace(clean_text)
             with torch.inference_mode():
                 return self._invoke_generator(
                     generator,
@@ -1033,7 +1119,7 @@ class KokoroTTS:
                     vocoder,
                     device,
                     torch_dtype,
-                    max(0.1, float(self.cfg.pace)),
+                    pace,
                 )
 
         return runtime
@@ -1073,7 +1159,7 @@ class KokoroTTS:
             clean_text = text.strip()
             if not clean_text:
                 return np.zeros(0, dtype=np.float32), self.cfg.out_sr
-            pace = max(0.1, float(self.cfg.pace))
+            pace = self._resolve_dynamic_pace(clean_text)
             voice = self.cfg.speaker or None
             return self._invoke_generator(
                 generator,

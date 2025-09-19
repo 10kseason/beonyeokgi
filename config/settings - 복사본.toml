@@ -15,8 +15,8 @@ temperature = 0.0
 vad = true
 
 [vad]
-frame_ms = 30
-aggressiveness = 3
+frame_ms = 20
+aggressiveness = 2
 min_speech_sec = 0.30
 silence_end_ms = 400
 

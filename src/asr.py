@@ -24,6 +24,7 @@ class ASRConfig:
     beam_size: int = 1
     input_sr: int = 16000
     temperature: float = 0.0
+    condition_on_previous_text: bool = True
 
 
 class ASR:
@@ -37,6 +38,7 @@ class ASR:
         beam_size: int = 1,
         input_sr: int = 16000,
         temperature: float = 0.0,
+        condition_on_previous_text: bool = True,
     ) -> None:
         self.cfg = ASRConfig(
             model=model,
@@ -47,7 +49,9 @@ class ASR:
             beam_size=beam_size,
             input_sr=input_sr,
             temperature=temperature,
+            condition_on_previous_text=condition_on_previous_text,
         )
+        self.cfg.condition_on_previous_text = bool(self.cfg.condition_on_previous_text)
         self.model = WhisperModel(
             self.cfg.model,
             device=self.cfg.device,
@@ -101,6 +105,7 @@ class ASR:
             beam_size=self.cfg.beam_size,
             vad_filter=True,
             temperature=float(self.cfg.temperature),
+            condition_on_previous_text=self.cfg.condition_on_previous_text,
         )
         text = " ".join(s.text.strip() for s in segments).strip()
         if not text:
