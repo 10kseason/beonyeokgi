@@ -18,7 +18,7 @@ from .preprocess import AudioPreprocessor
 from .llm_translator import LLMTranslator, LLMTranslatorConfig
 from .kokoro_subtitles import KokoroSubtitleStreamer, SubtitleStreamConfig
 from .tts_kokoro import KokoroTTS
-from .utils import contains_cjk, parse_sd_device
+from .utils import contains_cjk, detect_max_cuda_vram_gb, parse_sd_device
 from .vad import VADSegmenter
 from .voice_changer_client import VoiceChangerClient, VoiceChangerConfig
 
@@ -440,6 +440,8 @@ class TranslatorPipeline:
         self._current_output_device = output_device
         self._current_kokoro_device = kokoro_passthrough
 
+        detected_vram_gb = detect_max_cuda_vram_gb()
+
         preset_key = self.state.get_active_preset()
         preset = PRESETS.get(preset_key, PRESETS["latency"])
 
@@ -538,6 +540,18 @@ class TranslatorPipeline:
 
         vc_client = self._create_voice_changer()
         self._voice_changer = vc_client
+
+        kokoro_device_value = kokoro_cfg.get("device")
+        if isinstance(kokoro_device_value, str):
+            kokoro_device_clean = kokoro_device_value.strip().lower()
+        else:
+            kokoro_device_clean = str(kokoro_device_value).strip().lower() if kokoro_device_value else ""
+        if kokoro_device_clean in {"", "auto"}:
+            if detected_vram_gb >= 12.0:
+                kokoro_cfg["device"] = "cuda"
+                if "use_half" not in kokoro_cfg:
+                    kokoro_cfg["use_half"] = True
+                logger.info("Detected %.1f GiB VRAM; enabling Kokoro CUDA backend", detected_vram_gb)
 
         tts = KokoroTTS(
             model=kokoro_cfg.get("model", "hexgrad/Kokoro-82M"),

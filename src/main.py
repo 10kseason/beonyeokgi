@@ -13,7 +13,7 @@ import tomli_w
 
 from .pipeline import LANGUAGE_OPTIONS, PRESETS, SharedState, TranslatorPipeline
 from .ui import TranslatorUI
-from .utils import parse_sd_device
+from .utils import detect_max_cuda_vram_gb, parse_sd_device
 
 
 logger = logging.getLogger("vc-translator.main")
@@ -385,6 +385,8 @@ def _configure_acceleration(cfg: Dict[str, Any], preferred: str) -> tuple[str, s
     except Exception:
         cuda_available = False
 
+    vram_gb = detect_max_cuda_vram_gb() if cuda_available else 0.0
+
     mode = (preferred or "auto").strip().lower()
     if mode not in {"auto", "cpu", "cuda"}:
         mode = "auto"
@@ -398,8 +400,14 @@ def _configure_acceleration(cfg: Dict[str, Any], preferred: str) -> tuple[str, s
     if effective == "cuda":
         asr_cfg["device"] = "cuda"
         asr_cfg["compute_type"] = "float16"
-        kokoro_cfg["device"] = "cuda"
-        kokoro_cfg["use_half"] = True
+        if vram_gb >= 12.0:
+            kokoro_cfg["device"] = "cuda"
+            kokoro_cfg["use_half"] = True
+        else:
+            if str(kokoro_cfg.get("device", "")).strip().lower() == "cuda":
+                kokoro_cfg["device"] = "auto"
+            if "use_half" not in kokoro_cfg:
+                kokoro_cfg["use_half"] = False
     else:
         asr_cfg["device"] = "cpu"
         asr_cfg["compute_type"] = "int8"
