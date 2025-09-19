@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
-from typing import Dict
+from typing import Deque, Dict, List, Sequence, Tuple
 
 import logging
 import requests
@@ -38,6 +39,7 @@ class LLMTranslator:
     def __init__(self, cfg: LLMTranslatorConfig) -> None:
         self.cfg = cfg
         self._session = requests.Session()
+        self._history: Deque[Tuple[str, str]] = deque(maxlen=2)
 
     def translate(self, text: str, source_language: str) -> str:
         normalized = (source_language or "").split("-")[0].lower()
@@ -46,24 +48,50 @@ class LLMTranslator:
             return ""
         language_name = LANGUAGE_NAMES.get(normalized, normalized or "unknown language")
         prompt = self.cfg.system_prompt.format(language_name=language_name)
-        content = (
-            f"Please translate the following {language_name} text into natural English and return only the English translation.\n\n"
-            f"{stripped}"
-        )
+        history_snapshot = list(self._history)
         backend = (self.cfg.backend or "ollama").strip().lower()
         if backend == "lmstudio":
-            return self._translate_lmstudio(prompt, content, stripped)
-        return self._translate_ollama(prompt, content, stripped)
+            translated = self._translate_lmstudio(prompt, stripped, language_name, history_snapshot, stripped)
+        else:
+            translated = self._translate_ollama(prompt, stripped, language_name, history_snapshot, stripped)
+        translated = translated.strip()
+        if translated:
+            self._remember_history(stripped, translated)
+            return translated
+        return stripped
+
+    def reset_history(self) -> None:
+        self._history.clear()
 
     # ------------------------------------------------------------------
     # Backend implementations
     # ------------------------------------------------------------------
-    def _translate_ollama(self, prompt: str, content: str, fallback: str) -> str:
+    def _translate_ollama(
+        self,
+        prompt: str,
+        current_text: str,
+        language_name: str,
+        history: Sequence[Tuple[str, str]],
+        fallback: str,
+    ) -> str:
         url = f"{self.cfg.ollama_url.rstrip('/')}/api/generate"
         model = self.cfg.ollama_model or ""
         if not model:
             logger.warning("LLM translator (Ollama) model not configured; skipping translation")
             return fallback
+        context_lines = self._format_history_lines(history)
+        parts: List[str] = []
+        if context_lines:
+            parts.append("Context from the most recent translations:")
+            parts.extend(context_lines)
+            parts.append("")
+        parts.append(
+            "Translate the following "
+            f"{language_name} text into natural English and respond only with the English translation:"
+        )
+        parts.append("")
+        parts.append(current_text)
+        content = "\n".join(parts)
         payload = {
             "model": model,
             "prompt": f"{prompt}\n\nUser: {content}\nTranslator:",
@@ -80,7 +108,14 @@ class LLMTranslator:
         translated = data.get("response") or data.get("text") or ""
         return translated.strip() or fallback
 
-    def _translate_lmstudio(self, prompt: str, content: str, fallback: str) -> str:
+    def _translate_lmstudio(
+        self,
+        prompt: str,
+        current_text: str,
+        language_name: str,
+        history: Sequence[Tuple[str, str]],
+        fallback: str,
+    ) -> str:
         base = self.cfg.lmstudio_url.rstrip("/")
         if not base.endswith("/v1"):
             base = f"{base}/v1"
@@ -89,12 +124,10 @@ class LLMTranslator:
         if not model:
             logger.warning("LLM translator (LM Studio) model not configured; skipping translation")
             return fallback
+        messages = self._build_messages(prompt, language_name, history, current_text)
         payload = {
             "model": model,
-            "messages": [
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": content},
-            ],
+            "messages": messages,
             "temperature": max(0.0, float(self.cfg.temperature)),
         }
         try:
@@ -112,3 +145,51 @@ class LLMTranslator:
             return fallback
         translated = message.get("content", "")
         return translated.strip() or fallback
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+    def _remember_history(self, source: str, translated: str) -> None:
+        clean_source = source.strip()
+        clean_translated = translated.strip()
+        if not clean_source or not clean_translated:
+            return
+        if self._history and self._history[-1][0] == clean_source:
+            self._history[-1] = (clean_source, clean_translated)
+        else:
+            self._history.append((clean_source, clean_translated))
+
+    @staticmethod
+    def _format_history_lines(history: Sequence[Tuple[str, str]]) -> List[str]:
+        lines: List[str] = []
+        for idx, (source, translated) in enumerate(history, start=1):
+            src = source.strip()
+            tgt = translated.strip()
+            if not src or not tgt:
+                continue
+            lines.append(f"{idx}. Source: {src}")
+            lines.append(f"   Translation: {tgt}")
+        return lines
+
+    def _build_messages(
+        self,
+        system_prompt: str,
+        language_name: str,
+        history: Sequence[Tuple[str, str]],
+        current_text: str,
+    ) -> List[Dict[str, str]]:
+        messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
+        for source, translated in history:
+            src = source.strip()
+            tgt = translated.strip()
+            if not src or not tgt:
+                continue
+            messages.append({"role": "user", "content": src})
+            messages.append({"role": "assistant", "content": tgt})
+        user_content = (
+            "Translate the following "
+            f"{language_name} text into natural English and respond only with the English translation:\n\n"
+            f"{current_text}"
+        )
+        messages.append({"role": "user", "content": user_content})
+        return messages
