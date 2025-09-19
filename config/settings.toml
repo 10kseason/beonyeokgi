@@ -60,6 +60,20 @@ warmup_runs = 2
 [app]
 preset = "accuracy"
 
+[translator]
+use_llm = false
+llm_backend = "ollama"  # ollama | lmstudio
+timeout_sec = 8.0
+temperature = 0.2
+
+[translator.ollama]
+base_url = "http://localhost:11434"
+model = ""
+
+[translator.lmstudio]
+base_url = "http://localhost:1234/v1"
+model = ""
+
 [stream]
 mode = "chunk"
 normalize_dbfs = -2.5

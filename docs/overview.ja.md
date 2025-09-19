@@ -1,13 +1,13 @@
 # リアルタイム音声翻訳 – 技術概要 (日本語)
 
 ## 概要
-本アプリケーションは選択した入力デバイスからモノラル16bit PCM音声を取得し、発話区間を検出してからWhisperベースの音声認識を実行します。韓国語フィラー除去やHelsinki-NLPによるko/ja/zh→英語訳を行い、Kokoro 82Mによる音声合成を再生します。音声変換(VCC)連携は任意で、UIとは別スレッドのパイプラインが全体の状態と遅延を管理します。【F:src/audio_io.py†L10-L76】【F:src/vad.py†L19-L177】【F:src/asr.py†L29-L147】【F:src/pipeline.py†L331-L595】
+本アプリケーションは選択した入力デバイスからモノラル16bit PCM音声を取得し、発話区間を検出してからWhisperベースの音声認識を実行します。韓国語フィラー除去やHelsinki-NLPによるko/ja/zh→英語訳、またはGUIでLLMモードを有効にした際はOllama／LM Studioバックエンドによる翻訳を行い、Kokoro 82Mによる音声合成を再生します。音声変換(VCC)連携は任意で、UIとは別スレッドのパイプラインが全体の状態と遅延を管理します。【F:src/audio_io.py†L10-L76】【F:src/vad.py†L19-L177】【F:src/asr.py†L29-L147】【F:src/pipeline.py†L331-L639】【F:src/llm_translator.py†L1-L96】
 
 ## 信号フロー
 1. **キャプチャ:** `MicReader` が `sounddevice.RawInputStream` を用いて固定サイズのフレームをキューに蓄積し、コールバックがブロックされないようにします。【F:src/audio_io.py†L10-L76】
 2. **区間抽出:** `VADSegmenter` はフレーム長・感度・最大発話時間・チャンクストリーミングを設定できる WebRTC VAD を利用します。`ForcedSegmenter` を有効化すると、RMS レベルを監視して長い発話を強制的に切り出します。【F:src/vad.py†L19-L177】【F:src/pipeline.py†L405-L545】
 3. **前処理:** `AudioPreprocessor` は可能なら ffmpeg で16kHzへリサンプリングし、90Hz ハイパスと 7.2kHz ローパスを適用後、ラウドネス正規化・トゥルーピーク制限・緩やかなコンプレッションを行います。【F:src/preprocess.py†L192-L340】
-4. **認識:** ASR ラッパーは PCM を float32 に変換して Faster-Whisper を呼び出し、韓国語フィラーを削除した後に CJK 文字が残る場合は Helsinki-NLP 翻訳器で英語へ変換します。【F:src/asr.py†L29-L117】【F:src/pipeline.py†L556-L639】【F:src/translator.py†L10-L66】
+4. **認識:** ASR ラッパーは PCM を float32 に変換して Faster-Whisper を呼び出し、韓国語フィラーを削除した後に CJK 文字が残る場合は Helsinki-NLP 翻訳器、または LLM モード有効時は Ollama／LM Studio バックエンドで英語へ変換します。【F:src/asr.py†L29-L117】【F:src/pipeline.py†L556-L639】【F:src/translator.py†L10-L66】【F:src/llm_translator.py†L1-L96】
 5. **合成:** `KokoroTTS` は短い文をバッチ化してクロスフェードしながら再生し、メイン出力・パススルー用仮想マイク・VC失敗時のフォールバックデバイスへ同時にルーティングできます。【F:src/tts_kokoro.py†L120-L246】【F:src/tts_kokoro.py†L320-L366】【F:src/tts_kokoro.py†L428-L553】
 6. **音声変換 (任意):** 有効化すると `VoiceChangerClient` が生成され、Ookada VC Client API に int16 チャンクを送信し、サンプルレートの協調やストリーミング、WAV 保存を処理します。【F:src/pipeline.py†L706-L739】【F:src/voice_changer_client.py†L21-L184】
 7. **状態とUI:** `SharedState` が言語・プリセット・デバイス・遅延を同期し、`TranslatorUI` がデバイス切替・プリセット・計算モード・Kokoroミラーをリアルタイムに操作できる Tk UI を提供します。【F:src/pipeline.py†L144-L695】【F:src/ui.py†L10-L195】
