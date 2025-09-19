@@ -10,12 +10,13 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from queue import Empty
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from .audio_io import MicReader
 from .asr import ASR
 from .preprocess import AudioPreprocessor
 from .llm_translator import LLMTranslator, LLMTranslatorConfig
+from .kokoro_subtitles import KokoroSubtitleStreamer, SubtitleStreamConfig
 from .tts_kokoro import KokoroTTS
 from .utils import contains_cjk, parse_sd_device
 from .vad import VADSegmenter
@@ -386,6 +387,10 @@ class TranslatorPipeline:
             self._translator_settings = {}
             self.cfg["translator"] = self._translator_settings
         self._language_targets = {option.code: option.target for option in LANGUAGE_OPTIONS}
+        self._subtitle_streamer: Optional[KokoroSubtitleStreamer] = None
+        self._subtitle_queue: deque[Tuple[str, Optional[float], Optional[str], Optional[str]]] = deque()
+        self._last_subtitle_text: Optional[str] = None
+        self._kokoro_busy_until = 0.0
         self._forced_segmenter: Optional[ForcedSegmenter] = None
 
     # ------------------------------------------------------------------
@@ -532,29 +537,47 @@ class TranslatorPipeline:
         )
         self._tts = tts
         self.state.set_active_kokoro_device(kokoro_passthrough)
+        self._subtitle_streamer = self._create_subtitle_streamer()
+        self._subtitle_queue.clear()
+        self._last_subtitle_text = None
+        self._kokoro_busy_until = 0.0
 
         try:
             mic.start()
             logger.info("Translator pipeline started")
             while not self._stop_event.is_set():
                 self._apply_configuration(vad, asr, tts)
+                self._process_subtitle_queue()
                 try:
                     frame = mic.read(timeout=0.1)
                 except Empty:
+                    self._process_subtitle_queue()
                     continue
                 segments = self._collect_segments(vad, frame)
                 if not segments:
+                    self._process_subtitle_queue()
                     continue
                 for raw in segments:
                     await self._handle_segment(raw, input_sr, preproc, asr, tts)
                     if self._stop_event.is_set():
                         break
+                self._process_subtitle_queue()
         finally:
             try:
                 if tts is not None:
                     tts.flush()
             except Exception:
                 logger.debug("Failed to flush TTS on shutdown", exc_info=True)
+            streamer = self._subtitle_streamer
+            self._subtitle_streamer = None
+            self._subtitle_queue.clear()
+            self._last_subtitle_text = None
+            self._kokoro_busy_until = 0.0
+            if streamer is not None:
+                try:
+                    streamer.close()
+                except Exception:
+                    logger.debug("Failed to close Kokoro subtitle streamer", exc_info=True)
             mic.stop()
             self._forced_segmenter = None
 
@@ -582,6 +605,55 @@ class TranslatorPipeline:
             segments.append(forced_segment)
         return segments
 
+    def _enqueue_subtitle(
+        self,
+        text: str,
+        duration_ms: Optional[float],
+        source_language: Optional[str],
+        target_language: Optional[str],
+    ) -> None:
+        clean = text.strip()
+        if not clean:
+            return
+        if self._subtitle_streamer is None:
+            return
+        if clean == (self._last_subtitle_text or ""):
+            return
+        for existing in self._subtitle_queue:
+            if existing[0] == clean:
+                return
+        self._subtitle_queue.append((clean, duration_ms, source_language, target_language))
+
+    def _process_subtitle_queue(self, *, force_current: bool = False) -> None:
+        if not self._subtitle_queue:
+            return
+        streamer = self._subtitle_streamer
+        if streamer is None:
+            self._subtitle_queue.clear()
+            self._last_subtitle_text = None
+            return
+        now = time.perf_counter()
+        while self._subtitle_queue:
+            if not force_current and now < self._kokoro_busy_until:
+                break
+            text, duration_ms, source_language, target_language = self._subtitle_queue.popleft()
+            if not text or text == self._last_subtitle_text:
+                force_current = False
+                now = time.perf_counter()
+                continue
+            try:
+                streamer.submit(
+                    text,
+                    duration_ms=duration_ms,
+                    source_language=source_language,
+                    target_language=target_language,
+                )
+            except Exception:
+                logger.debug("Failed to stream Kokoro subtitle", exc_info=True)
+            self._last_subtitle_text = text
+            force_current = False
+            now = time.perf_counter()
+
     async def _handle_segment(
         self,
         segment: bytes,
@@ -607,6 +679,8 @@ class TranslatorPipeline:
         per_sentence_ms = segment_ms / len(sentences) if segment_ms > 0 and sentences else None
         tts_elapsed_total = 0.0
         active_language = self.state.get_active_language()
+        normalized_language = self._normalize_language(active_language)
+        target_language = self._language_targets.get(normalized_language)
         for sentence in sentences:
             sentence = sentence.strip()
             if not sentence:
@@ -618,13 +692,22 @@ class TranslatorPipeline:
                 logger.info("Skipping TTS because text is not English after translation: %s", sentence)
                 continue
             speak_start = time.perf_counter()
+            was_idle = speak_start >= self._kokoro_busy_until
             try:
                 tts.synth_to_play(sentence, src_duration_ms=per_sentence_ms)
             except Exception:
                 logger.exception("Kokoro playback failed")
                 break
-            speak_elapsed_ms = (time.perf_counter() - speak_start) * 1000.0
+            after_speak = time.perf_counter()
+            speak_elapsed_ms = (after_speak - speak_start) * 1000.0
             tts_elapsed_total += speak_elapsed_ms
+            busy_ms = per_sentence_ms if per_sentence_ms and per_sentence_ms > 0 else speak_elapsed_ms
+            if busy_ms <= 0.0:
+                busy_ms = speak_elapsed_ms
+            busy_ms = max(busy_ms, speak_elapsed_ms, 100.0)
+            self._kokoro_busy_until = max(self._kokoro_busy_until, after_speak + busy_ms / 1000.0)
+            self._enqueue_subtitle(sentence, per_sentence_ms, active_language, target_language)
+            self._process_subtitle_queue(force_current=was_idle)
             logger.info("Kokoro synthesis/playback (%.1f ms): %s", speak_elapsed_ms, sentence)
         total_latency = asr_elapsed + tts_elapsed_total
         self._latency_history.append(total_latency)
@@ -668,7 +751,8 @@ class TranslatorPipeline:
 
         timeout_value = settings.get("timeout_sec", settings.get("timeout"))
         cfg.timeout_sec = _coerce_float(timeout_value, cfg.timeout_sec)
-        cfg.temperature = _coerce_float(settings.get("temperature"), cfg.temperature)
+        cfg.temperature = 0.2
+        settings["temperature"] = cfg.temperature
 
         system_prompt = settings.get("system_prompt")
         if isinstance(system_prompt, str) and system_prompt.strip():
@@ -719,6 +803,15 @@ class TranslatorPipeline:
             self._llm_translator_key = key
         return self._llm_translator
 
+    def _reset_llm_history(self) -> None:
+        translator = self._llm_translator
+        if translator is None:
+            return
+        try:
+            translator.reset_history()
+        except Exception:
+            logger.debug("Failed to reset LLM translator history", exc_info=True)
+
     def _ensure_english_text(self, text: str, language: Optional[str]) -> str:
         normalized = self._normalize_language(language)
         if not normalized:
@@ -763,6 +856,7 @@ class TranslatorPipeline:
             asr.set_language(language)
             self.cfg.setdefault("asr", {})["language"] = language
             self.state.set_active_language(language)
+            self._reset_llm_history()
         if cfg["requested_preset"] != cfg["active_preset"]:
             preset = PRESETS.get(cfg["requested_preset"], PRESETS["latency"])
             vad.configure_chunking(preset.chunk_min_ms, preset.chunk_max_ms, preset.hop_ms)
@@ -829,6 +923,52 @@ class TranslatorPipeline:
             )
         except Exception:
             logger.debug("Failed to persist devices", exc_info=True)
+
+    def _create_subtitle_streamer(self) -> Optional[KokoroSubtitleStreamer]:
+        settings = self.cfg.get("kokoro_subtitles")
+        if not isinstance(settings, dict):
+            return None
+        endpoint = settings.get("endpoint")
+        if not isinstance(endpoint, str) or not endpoint.strip():
+            return None
+        config = SubtitleStreamConfig(endpoint=endpoint.strip())
+        method = settings.get("method")
+        if isinstance(method, str) and method.strip():
+            config.method = method.strip().upper()
+        timeout = settings.get("timeout_sec", settings.get("timeout"))
+        try:
+            config.timeout_sec = float(timeout)
+        except (TypeError, ValueError):
+            pass
+        include_ts = settings.get("include_timestamps")
+        if include_ts is not None:
+            config.include_timestamps = bool(include_ts)
+        retry_limit = settings.get("retry_limit")
+        if retry_limit is not None:
+            try:
+                config.retry_limit = max(0, int(retry_limit))
+            except (TypeError, ValueError):
+                pass
+        retry_backoff = settings.get("retry_backoff_sec")
+        if retry_backoff is not None:
+            try:
+                config.retry_backoff_sec = max(0.0, float(retry_backoff))
+            except (TypeError, ValueError):
+                pass
+        headers_value = settings.get("headers")
+        if isinstance(headers_value, dict):
+            normalized_headers: Dict[str, str] = {}
+            for key, value in headers_value.items():
+                try:
+                    normalized_headers[str(key)] = str(value)
+                except Exception:
+                    continue
+            config.headers = normalized_headers
+        try:
+            return KokoroSubtitleStreamer(config)
+        except Exception:
+            logger.warning("Failed to initialize Kokoro subtitle streamer", exc_info=True)
+            return None
 
     def _create_voice_changer(self) -> Optional[VoiceChangerClient]:
         vc_cfg = self.cfg.get("voice_changer", {}) or {}
