@@ -7,7 +7,7 @@ output_device = ""
 [asr]
 whisper_model = "medium" # recommended: large-v3-turbo for accuracy, medium for lower load
 device = "cuda"
-compute_type = "int8"
+compute_type = "float16"  # CUDA acceleration; cpu mode will override to int8
 task = "translate"
 language = "ko"
 beam_size = 2

@@ -493,10 +493,38 @@ class TranslatorPipeline:
         preproc = AudioPreprocessor(target_sr=16000, highpass_hz=90.0, lowpass_hz=7200.0)
 
         asr_cfg = self.cfg.get("asr", {}) or {}
+
+        raw_device = asr_cfg.get("device")
+        if isinstance(raw_device, str):
+            device_clean = raw_device.strip()
+            asr_device = device_clean or "cuda"
+        elif raw_device:
+            asr_device = str(raw_device)
+        else:
+            asr_device = "cuda"
+
+        raw_compute_type = asr_cfg.get("compute_type")
+        if isinstance(raw_compute_type, str):
+            compute_clean = raw_compute_type.strip()
+            asr_compute_type = compute_clean or "float16"
+        elif raw_compute_type:
+            asr_compute_type = str(raw_compute_type)
+        else:
+            asr_compute_type = "float16"
+
+        device_lower = asr_device.lower() if isinstance(asr_device, str) else str(asr_device).lower()
+        compute_lower = (
+            asr_compute_type.lower()
+            if isinstance(asr_compute_type, str)
+            else str(asr_compute_type).lower()
+        )
+        if device_lower.startswith("cuda") and compute_lower == "int8":
+            asr_compute_type = "int8_float16"
+
         asr = ASR(
             model=asr_cfg.get("whisper_model", "large-v3-turbo"),
-            device=asr_cfg.get("device", "cpu"),
-            compute_type=asr_cfg.get("compute_type", "int8"),
+            device=asr_device,
+            compute_type=asr_compute_type,
             task=asr_cfg.get("task", "translate"),
             language=asr_cfg.get("language", "ko"),
             beam_size=preset.beam_size,
