@@ -13,12 +13,6 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional,
 import numpy as np
 import sounddevice as sd
 
-try:  # pragma: no cover - optional dependency
-    from huggingface_hub.utils import EntryNotFoundError, LocalEntryNotFoundError
-except Exception:  # pragma: no cover - optional dependency
-    EntryNotFoundError = None  # type: ignore
-    LocalEntryNotFoundError = None  # type: ignore
-
 from .utils import float32_to_int16, parse_sd_device, resample_audio
 
 try:  # Optional dependency used when available
@@ -31,39 +25,6 @@ if TYPE_CHECKING:  # pragma: no cover
 
 
 logger = logging.getLogger("vc-translator.tts.kokoro")
-
-
-_MISSING_MODEL_ERROR_TYPES: Tuple[type[BaseException], ...] = (FileNotFoundError, OSError)
-_missing_extra: List[type[BaseException]] = []
-if EntryNotFoundError is not None:
-    _missing_extra.append(EntryNotFoundError)  # type: ignore[arg-type]
-if LocalEntryNotFoundError is not None:
-    _missing_extra.append(LocalEntryNotFoundError)  # type: ignore[arg-type]
-if _missing_extra:
-    _MISSING_MODEL_ERROR_TYPES = _MISSING_MODEL_ERROR_TYPES + tuple(_missing_extra)
-
-_MISSING_MODEL_KEYWORDS: Tuple[str, ...] = (
-    "not found",
-    "no such file",
-    "missing model",
-    "download the model",
-    "download the models",
-    "models have not been downloaded",
-    "cannot find",
-)
-
-
-def _is_missing_model_error(exc: BaseException) -> bool:
-    if isinstance(exc, _MISSING_MODEL_ERROR_TYPES):
-        return True
-    message = str(exc).lower()
-    return any(keyword in message for keyword in _MISSING_MODEL_KEYWORDS)
-
-
-class MissingKokoroModelError(RuntimeError):
-    def __init__(self, model: str, message: str) -> None:
-        super().__init__(message)
-        self.model = model
 
 
 @dataclass
@@ -144,7 +105,17 @@ DEFAULT_PROBE_TEXT = (
     "Warmup sentence for Kokoro backend latency benchmarking. "
     "This should roughly produce one second of speech."
 )
-
+DEFAULT_KOKORO_VOICES: Dict[str, str] = {
+    "a": "af_bella",
+    "b": "bf_alice",
+    "e": "ef_dora",
+    "f": "ff_siwis",
+    "h": "hf_alpha",
+    "i": "if_sara",
+    "p": "pf_dora",
+    "j": "jf_nezumi",
+    "z": "zf_xiaoxiao",
+}
 
 class KokoroTTS:
     """Wrapper around Kokoro 82M text-to-speech backends."""
@@ -309,18 +280,10 @@ class KokoroTTS:
         return float(min(max(estimate, 300.0), 4000.0))
 
     def _synthesize_and_play(self, text: str) -> Optional[bool]:
-        try:
-            runtime = self._ensure_runtime()
-        except MissingKokoroModelError:
-            raise
-        except Exception as exc:
-            logger.error("Failed to initialize Kokoro runtime: %s", exc)
-            return None
+        runtime = self._ensure_runtime()
         synth_start = time.perf_counter()
         try:
             audio_f32, sample_rate = runtime(text)
-        except MissingKokoroModelError:
-            raise
         except Exception as exc:
             logger.error("Kokoro synthesis failed: %s", exc)
             return None
@@ -655,8 +618,6 @@ class KokoroTTS:
         for plan in plans:
             try:
                 runtime, latency = self._benchmark_plan(plan)
-            except MissingKokoroModelError:
-                raise
             except Exception as exc:
                 logger.warning("Skipping Kokoro backend %s: %s", plan.label or plan.backend, exc)
                 continue
@@ -842,15 +803,10 @@ class KokoroTTS:
         for _ in range(warmup_runs):
             try:
                 runtime(self._probe_text)
-            except MissingKokoroModelError:
-                raise
             except Exception:
                 break
         start = time.perf_counter()
-        try:
-            runtime(self._probe_text)
-        except MissingKokoroModelError:
-            raise
+        runtime(self._probe_text)
         elapsed = time.perf_counter() - start
         return runtime, elapsed
 
@@ -868,8 +824,6 @@ class KokoroTTS:
         plan = self._plans[self._active_plan_idx]
         try:
             runtime = plan.runtime or self._build_runtime_for_plan(plan, persist=True)
-        except MissingKokoroModelError:
-            raise
         except Exception as exc:
             logger.error("Failed to switch Kokoro backend to %s: %s", plan.label or plan.backend, exc)
             return False
@@ -902,12 +856,145 @@ class KokoroTTS:
             raise RuntimeError(
                 "kokoro package is required for PyTorch backend. Install from the official Kokoro repository."
             ) from exc
+        if hasattr(kokoro, "KPipeline") and hasattr(kokoro, "KModel"):
+            return self._build_pytorch_runtime_kpipeline(kokoro)
+        return self._build_pytorch_runtime_legacy(kokoro)
+
+    def _build_pytorch_runtime_kpipeline(self, kokoro: Any) -> Callable[[str], Tuple[np.ndarray, int]]:
         try:
             torch = importlib.import_module("torch")
         except ImportError as exc:  # pragma: no cover - optional dependency
             raise RuntimeError("PyTorch is required for Kokoro PyTorch backend.") from exc
 
-        device = torch.device(self.cfg.device)
+        device = self._resolve_torch_device(torch)
+        repo_id = self.cfg.model or "hexgrad/Kokoro-82M"
+        try:
+            model = kokoro.KModel(repo_id=repo_id)
+            model = model.to(device)
+            model.eval()
+        except Exception as exc:
+            raise RuntimeError(f"Failed to initialize Kokoro model '{repo_id}': {exc}") from exc
+
+        if bool(self.cfg.use_half) and device.type in {"cuda", "hip"}:
+            try:
+                model.half()
+            except Exception as exc:
+                logger.debug("Skipping Kokoro FP16 mode: %s", exc)
+
+        lang_code = self._infer_kokoro_lang_code(self.cfg.speaker)
+        speaker = self._normalize_kokoro_speaker(self.cfg.speaker, lang_code)
+        try:
+            pipeline = kokoro.KPipeline(
+                lang_code=lang_code,
+                repo_id=repo_id,
+                model=model,
+                device=device.type,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Failed to initialize Kokoro pipeline for language '{lang_code}': {exc}") from exc
+
+        try:
+            with torch.inference_mode():
+                pipeline.load_voice(speaker)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to load Kokoro voice '{speaker}'. Set [kokoro].speaker to a supported voice."
+            ) from exc
+
+        sample_rate = 24000
+
+        def runtime(text: str) -> Tuple[np.ndarray, int]:
+            clean_text = text.strip()
+            if not clean_text:
+                return np.zeros(0, dtype=np.float32), sample_rate
+            speed = max(0.1, float(self.cfg.pace))
+            audio_chunks: List[np.ndarray] = []
+            with torch.inference_mode():
+                for result in pipeline(clean_text, voice=speaker, speed=speed):
+                    audio_tensor = getattr(result, "audio", None)
+                    if audio_tensor is None:
+                        continue
+                    if hasattr(audio_tensor, "detach"):
+                        audio_np = audio_tensor.detach().cpu().numpy()
+                    else:
+                        audio_np = np.asarray(audio_tensor)
+                    if audio_np.ndim > 1:
+                        audio_np = np.mean(audio_np, axis=0)
+                    audio_chunks.append(audio_np.astype(np.float32, copy=False))
+            if not audio_chunks:
+                return np.zeros(0, dtype=np.float32), sample_rate
+            combined = np.concatenate(audio_chunks).astype(np.float32, copy=False)
+            return combined, sample_rate
+
+        return runtime
+
+    def _resolve_torch_device(self, torch_mod: Any) -> Any:
+        device_str = str(self.cfg.device or "auto").strip().lower()
+        if device_str in {"auto", "", "none"}:
+            if hasattr(torch_mod, "cuda") and callable(getattr(torch_mod.cuda, "is_available", None)) and torch_mod.cuda.is_available():
+                return torch_mod.device("cuda")
+            mps = getattr(getattr(torch_mod, "backends", None), "mps", None)
+            if hasattr(mps, "is_available") and mps.is_available():
+                return torch_mod.device("mps")
+            return torch_mod.device("cpu")
+        try:
+            return torch_mod.device(device_str)
+        except Exception as exc:
+            logger.warning("Invalid Kokoro device '%s'; falling back to CPU (%s)", device_str, exc)
+            return torch_mod.device("cpu")
+
+    def _infer_kokoro_lang_code(self, speaker: str) -> str:
+        base = (speaker or "").strip()
+        if base:
+            first = base.split(",", 1)[0].strip()
+            if first.endswith(".pt"):
+                first = first[:-3]
+            if first:
+                prefix = first.split("_", 1)[0].lower()
+                alias = {
+                    "en-us": "a",
+                    "en-gb": "b",
+                    "es": "e",
+                    "fr": "f",
+                    "fr-fr": "f",
+                    "hi": "h",
+                    "it": "i",
+                    "pt": "p",
+                    "pt-br": "p",
+                    "ja": "j",
+                    "zh": "z",
+                }.get(prefix)
+                if alias:
+                    return alias
+                key = prefix[:1]
+                if key in DEFAULT_KOKORO_VOICES:
+                    return key
+        return "a"
+
+    def _normalize_kokoro_speaker(self, speaker: str, lang_code: str) -> str:
+        raw = (speaker or "").strip()
+        if raw:
+            parts = [part.strip() for part in raw.split(",") if part.strip()]
+            normalized_parts = [part[:-3] if part.endswith(".pt") else part for part in parts]
+            normalized = ",".join(normalized_parts)
+        else:
+            normalized = ""
+        if not normalized:
+            normalized = DEFAULT_KOKORO_VOICES.get(lang_code, DEFAULT_KOKORO_VOICES["a"])
+            logger.info(
+                "No Kokoro speaker configured; defaulting to voice '%s' for language '%s'.",
+                normalized,
+                lang_code,
+            )
+        return normalized
+
+    def _build_pytorch_runtime_legacy(self, kokoro: Any) -> Callable[[str], Tuple[np.ndarray, int]]:
+        try:
+            torch = importlib.import_module("torch")
+        except ImportError as exc:  # pragma: no cover - optional dependency
+            raise RuntimeError("PyTorch is required for Kokoro PyTorch backend.") from exc
+
+        device = self._resolve_torch_device(torch)
         use_half = bool(self.cfg.use_half)
         wants_fp16 = use_half and device.type in {"cuda", "hip"}
         torch_dtype = torch.float16 if wants_fp16 else torch.float32
@@ -1030,29 +1117,12 @@ class KokoroTTS:
                 return True
         return False
 
-    def _raise_missing_model(self, model: str, exc: BaseException) -> None:
-        message = (
-            f"Kokoro 모델 '{model}'을 찾을 수 없습니다.\n\n"
-            "명령 프롬프트(또는 PowerShell)에서 아래 명령으로 모델을 다운로드한 뒤 다시 실행해 주세요.\n"
-            f"kokoro download \"{model}\"\n\n세부 정보: {exc}"
-        )
-        raise MissingKokoroModelError(model, message) from exc
-
     def _invoke_loader(self, loader: Callable[..., Any], model: str, **kwargs: Any) -> Any:
         try:
             filtered = {k: v for k, v in kwargs.items() if self._supports_kw(loader, k)}
             return loader(model, **filtered)
         except TypeError:
-            try:
-                return loader(model)
-            except Exception as exc:
-                if _is_missing_model_error(exc):
-                    self._raise_missing_model(model, exc)
-                raise
-        except Exception as exc:
-            if _is_missing_model_error(exc):
-                self._raise_missing_model(model, exc)
-            raise
+            return loader(model)
 
     def _invoke_onnx_loader(self, loader: Callable[..., Any], model: str, providers: Sequence[str]) -> Any:
         kwargs: dict[str, Any] = {}
@@ -1065,16 +1135,7 @@ class KokoroTTS:
         try:
             return loader(model, **kwargs)
         except TypeError:
-            try:
-                return loader(model)
-            except Exception as exc:
-                if _is_missing_model_error(exc):
-                    self._raise_missing_model(model, exc)
-                raise
-        except Exception as exc:
-            if _is_missing_model_error(exc):
-                self._raise_missing_model(model, exc)
-            raise
+            return loader(model)
 
     def _load_voice(self, module: Any, speaker: str) -> Any:
         if not speaker:

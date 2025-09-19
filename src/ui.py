@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import ttk
 from typing import Callable, Dict
 
 from .pipeline import LANGUAGE_OPTIONS, PRESETS, SharedState
@@ -14,12 +14,16 @@ class TranslatorUI:
         on_change_input: Callable[[], None],
         on_change_output: Callable[[], None],
         on_change_kokoro: Callable[[], None],
+        on_change_compute: Callable[[str], None],
+        on_sync_kokoro: Callable[[], None],
         on_close: Callable[[], None],
     ) -> None:
         self.state = state
         self._input_callback = on_change_input
         self._output_callback = on_change_output
         self._kokoro_callback = on_change_kokoro
+        self._compute_callback = on_change_compute
+        self._sync_kokoro_callback = on_sync_kokoro
         self._close_callback = on_close
 
         self.root = tk.Tk()
@@ -31,12 +35,17 @@ class TranslatorUI:
         self._language_labels: Dict[str, str] = {option.code: option.label for option in LANGUAGE_OPTIONS}
         self._language_codes: Dict[str, str] = {option.label: option.code for option in LANGUAGE_OPTIONS}
         self._preset_labels: Dict[str, str] = {preset.key: preset.label for preset in PRESETS.values()}
+        self._compute_labels: Dict[str, str] = {"auto": "Auto", "cpu": "CPU", "cuda": "CUDA"}
+        self._compute_codes: Dict[str, str] = {label: code for code, label in self._compute_labels.items()}
+
+        snapshot = self.state.snapshot()
 
         self.input_label_var = tk.StringVar(value="")
         self.output_label_var = tk.StringVar(value="")
         self.kokoro_label_var = tk.StringVar(value="")
-        self.language_var = tk.StringVar(value=self._language_labels.get("ko", "한국어 → EN"))
-        self.preset_var = tk.StringVar(value=self._preset_labels.get("latency", "지연 우선"))
+        self.language_var = tk.StringVar(value=self._language_labels.get(snapshot.get("language", "ko"), "Korean -> EN"))
+        self.preset_var = tk.StringVar(value=self._preset_labels.get(snapshot.get("preset", "latency"), "Low latency"))
+        self.compute_var = tk.StringVar(value=self._compute_labels.get(snapshot.get("compute_mode", "auto"), "Auto"))
         self.latency_value_var = tk.StringVar(value="0 ms")
 
         self._build()
@@ -50,29 +59,32 @@ class TranslatorUI:
         frame.pack(fill="both", expand=True)
 
         # Devices
-        device_frame = ttk.LabelFrame(frame, text="오디오 장치", padding=(12, 8))
+        device_frame = ttk.LabelFrame(frame, text="Audio Devices", padding=(12, 8))
         device_frame.pack(fill="x", pady=(0, 12))
 
-        ttk.Label(device_frame, text="입력 장치").grid(row=0, column=0, sticky="w")
+        ttk.Label(device_frame, text="Input device").grid(row=0, column=0, sticky="w")
         ttk.Label(device_frame, textvariable=self.input_label_var, width=28).grid(row=0, column=1, padx=(12, 8), sticky="w")
-        ttk.Button(device_frame, text="변경", command=self._handle_input_change).grid(row=0, column=2)
+        ttk.Button(device_frame, text="Change", command=self._handle_input_change).grid(row=0, column=2)
 
-        ttk.Label(device_frame, text="출력 장치").grid(row=1, column=0, pady=(6, 0), sticky="w")
+        ttk.Label(device_frame, text="Output device").grid(row=1, column=0, pady=(6, 0), sticky="w")
         ttk.Label(device_frame, textvariable=self.output_label_var, width=28).grid(
             row=1, column=1, padx=(12, 8), pady=(6, 0), sticky="w"
         )
-        ttk.Button(device_frame, text="변경", command=self._handle_output_change).grid(row=1, column=2, pady=(6, 0))
+        ttk.Button(device_frame, text="Change", command=self._handle_output_change).grid(row=1, column=2, pady=(6, 0))
 
-        ttk.Label(device_frame, text="Kokoro 출력").grid(row=2, column=0, pady=(6, 0), sticky="w")
+        ttk.Label(device_frame, text="Kokoro output").grid(row=2, column=0, pady=(6, 0), sticky="w")
         ttk.Label(device_frame, textvariable=self.kokoro_label_var, width=28).grid(
             row=2, column=1, padx=(12, 8), pady=(6, 0), sticky="w"
         )
-        ttk.Button(device_frame, text="변경", command=self._handle_kokoro_change).grid(row=2, column=2, pady=(6, 0))
+        ttk.Button(device_frame, text="Change", command=self._handle_kokoro_change).grid(row=2, column=2, pady=(6, 0))
+        ttk.Button(device_frame, text="Sync with output", command=self._handle_kokoro_sync).grid(
+            row=2, column=3, padx=(6, 0), pady=(6, 0)
+        )
 
         # Language selection
-        lang_frame = ttk.LabelFrame(frame, text="언어 고정", padding=(12, 8))
+        lang_frame = ttk.LabelFrame(frame, text="Language lock", padding=(12, 8))
         lang_frame.pack(fill="x", pady=(0, 12))
-        ttk.Label(lang_frame, text="입력 언어").grid(row=0, column=0, sticky="w")
+        ttk.Label(lang_frame, text="Input language").grid(row=0, column=0, sticky="w")
         lang_box = ttk.Combobox(
             lang_frame,
             textvariable=self.language_var,
@@ -83,8 +95,22 @@ class TranslatorUI:
         lang_box.grid(row=0, column=1, padx=(12, 0), sticky="w")
         lang_box.bind("<<ComboboxSelected>>", self._on_language_selected)
 
+        # Compute mode
+        compute_frame = ttk.LabelFrame(frame, text="Compute mode", padding=(12, 8))
+        compute_frame.pack(fill="x", pady=(0, 12))
+        ttk.Label(compute_frame, text="Acceleration").grid(row=0, column=0, sticky="w")
+        compute_box = ttk.Combobox(
+            compute_frame,
+            textvariable=self.compute_var,
+            values=list(self._compute_labels.values()),
+            state="readonly",
+            width=18,
+        )
+        compute_box.grid(row=0, column=1, padx=(12, 0), sticky="w")
+        compute_box.bind("<<ComboboxSelected>>", self._on_compute_selected)
+
         # Presets
-        preset_frame = ttk.LabelFrame(frame, text="세팅 프리셋", padding=(12, 8))
+        preset_frame = ttk.LabelFrame(frame, text="Preset options", padding=(12, 8))
         preset_frame.pack(fill="x", pady=(0, 12))
         for idx, preset in enumerate(PRESETS.values()):
             ttk.Radiobutton(
@@ -96,7 +122,7 @@ class TranslatorUI:
             ).grid(row=0, column=idx, padx=(0, 16), sticky="w")
 
         # Latency gauge
-        latency_frame = ttk.LabelFrame(frame, text="지연 (ms)", padding=(12, 12))
+        latency_frame = ttk.LabelFrame(frame, text="Latency (ms)", padding=(12, 12))
         latency_frame.pack(fill="x")
         self.latency_bar = ttk.Progressbar(latency_frame, maximum=3000, length=320)
         self.latency_bar.grid(row=0, column=0, sticky="we")
@@ -113,6 +139,12 @@ class TranslatorUI:
         if code:
             self.state.request_language(code)
 
+    def _on_compute_selected(self, _event: object) -> None:
+        label = self.compute_var.get()
+        mode = self._compute_codes.get(label)
+        if mode:
+            self._compute_callback(mode)
+
     def _on_preset_changed(self) -> None:
         label = self.preset_var.get()
         for key, display in self._preset_labels.items():
@@ -128,6 +160,9 @@ class TranslatorUI:
 
     def _handle_kokoro_change(self) -> None:
         self._kokoro_callback()
+
+    def _handle_kokoro_sync(self) -> None:
+        self._sync_kokoro_callback()
 
     def _handle_close(self) -> None:
         self._close_callback()
@@ -150,19 +185,18 @@ class TranslatorUI:
             self.language_var.set(lang_label)
 
         preset_label = self._preset_labels.get(snap.get("preset", "latency"), self.preset_var.get())
+        compute_label = self._compute_labels.get(snap.get("compute_mode", "auto"), self.compute_var.get())
+        if self.compute_var.get() != compute_label:
+            self.compute_var.set(compute_label)
         if self.preset_var.get() != preset_label:
             self.preset_var.set(preset_label)
-
-        while True:
-            alert = self.state.pop_alert()
-            if alert is None:
-                break
-            try:
-                messagebox.showerror("Kokoro 모델 다운로드 필요", alert)
-            except Exception:
-                print(alert)
 
         self.root.after(200, self._refresh)
 
     def run(self) -> None:
         self.root.mainloop()
+
+
+
+
+

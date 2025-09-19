@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import audioop
 import logging
+import math
 import re
 import threading
 import time
@@ -12,9 +14,8 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from .audio_io import MicReader
 from .asr import ASR
-from .kokoro_subtitles import KokoroSubtitleStreamer, SubtitleStreamConfig
 from .preprocess import AudioPreprocessor
-from .tts_kokoro import KokoroTTS, MissingKokoroModelError
+from .tts_kokoro import KokoroTTS
 from .utils import contains_cjk, parse_sd_device
 from .vad import VADSegmenter
 from .voice_changer_client import VoiceChangerClient, VoiceChangerConfig
@@ -36,9 +37,9 @@ class LanguageOption:
 
 
 LANGUAGE_OPTIONS: Sequence[LanguageOption] = (
-    LanguageOption("ko", "한국어 → EN", "en"),
-    LanguageOption("ja", "일본어 → EN", "en"),
-    LanguageOption("zh", "중국어 → EN", "en"),
+    LanguageOption("ko", "Korean -> EN", "en"),
+    LanguageOption("ja", "Japanese -> EN", "en"),
+    LanguageOption("zh", "Chinese -> EN", "en"),
 )
 
 
@@ -53,10 +54,75 @@ class Preset:
     temperature: float
 
 
+@dataclass(frozen=True)
+class ForcedSegmentConfig:
+    threshold_dbfs: float
+    min_segment_ms: int
+    sustained_loud_ms: int
+    max_buffer_ms: int
+
+
+class ForcedSegmenter:
+    def __init__(self, frame_ms: int, cfg: ForcedSegmentConfig) -> None:
+        self.frame_ms = max(1, int(frame_ms))
+        self.cfg = ForcedSegmentConfig(
+            threshold_dbfs=float(cfg.threshold_dbfs),
+            min_segment_ms=max(self.frame_ms, int(cfg.min_segment_ms)),
+            sustained_loud_ms=max(self.frame_ms, int(cfg.sustained_loud_ms)),
+            max_buffer_ms=max(self.frame_ms, int(cfg.max_buffer_ms)),
+        )
+        self.reset()
+
+    def reset(self) -> None:
+        self._buffer = bytearray()
+        self._buffer_ms = 0
+        self._speech_ms = 0
+        self._loud_run_ms = 0
+        self._silence_run_ms = 0
+        self._active = False
+
+    def push(self, frame: bytes) -> Optional[bytes]:
+        if not frame:
+            return None
+        rms = audioop.rms(frame, 2)
+        level = -120.0 if rms <= 0 else 20.0 * math.log10(rms / 32768.0)
+        is_loud = level >= self.cfg.threshold_dbfs
+        if not self._active:
+            if not is_loud:
+                return None
+            self._active = True
+        self._buffer.extend(frame)
+        self._buffer_ms += self.frame_ms
+        if is_loud:
+            self._speech_ms += self.frame_ms
+            self._loud_run_ms += self.frame_ms
+            self._silence_run_ms = 0
+        else:
+            self._silence_run_ms += self.frame_ms
+            self._loud_run_ms = 0
+        if self._buffer_ms >= self.cfg.max_buffer_ms:
+            return self._emit(force=True)
+        if self._loud_run_ms >= self.cfg.sustained_loud_ms:
+            return self._emit(force=True)
+        if not is_loud and self._speech_ms >= self.cfg.min_segment_ms:
+            return self._emit(force=False)
+        if not is_loud and self._silence_run_ms >= self.frame_ms * 2:
+            self.reset()
+        return None
+
+    def _emit(self, force: bool) -> Optional[bytes]:
+        if self._speech_ms < self.cfg.min_segment_ms and not force:
+            self.reset()
+            return None
+        segment = bytes(self._buffer)
+        self.reset()
+        return segment
+
+
 PRESETS: Dict[str, Preset] = {
     "latency": Preset(
         key="latency",
-        label="지연 우선",
+        label="Low latency",
         chunk_min_ms=1000,
         chunk_max_ms=1200,
         hop_ms=250,
@@ -65,7 +131,7 @@ PRESETS: Dict[str, Preset] = {
     ),
     "accuracy": Preset(
         key="accuracy",
-        label="정확도 우선",
+        label="High accuracy",
         chunk_min_ms=1400,
         chunk_max_ms=1600,
         hop_ms=320,
@@ -86,6 +152,7 @@ class SharedState:
         output_label: str,
         kokoro_device: Optional[object],
         kokoro_label: str,
+        compute_mode: str,
     ) -> None:
         self._lock = threading.Lock()
         self._requested_language = language
@@ -101,9 +168,10 @@ class SharedState:
         self._requested_kokoro_device = kokoro_device
         self._active_kokoro_device = kokoro_device
         self._kokoro_label = kokoro_label or ""
+        self._requested_compute_mode = (compute_mode or "auto").strip().lower()
+        self._active_compute_mode = self._requested_compute_mode
         self._generation = 0
         self.latency_ms = 0.0
-        self._alerts: List[str] = []
 
     # ------------------------------------------------------------------
     # Requests from UI thread
@@ -141,6 +209,13 @@ class SharedState:
                 self._generation += 1
             self._kokoro_label = label or ""
 
+    def request_compute_mode(self, mode: str) -> None:
+        normalized = (mode or "auto").strip().lower()
+        with self._lock:
+            if normalized != self._requested_compute_mode:
+                self._requested_compute_mode = normalized
+                self._generation += 1
+
     # ------------------------------------------------------------------
     # Pipeline thread interactions
     # ------------------------------------------------------------------
@@ -157,6 +232,8 @@ class SharedState:
                 "active_output": self._active_output_device,
                 "requested_kokoro": self._requested_kokoro_device,
                 "active_kokoro": self._active_kokoro_device,
+                "requested_compute_mode": self._requested_compute_mode,
+                "active_compute_mode": self._active_compute_mode,
                 "generation": self._generation,
             }
 
@@ -180,6 +257,11 @@ class SharedState:
         with self._lock:
             self._active_kokoro_device = device
 
+    def set_active_compute_mode(self, mode: str) -> None:
+        normalized = (mode or "auto").strip().lower()
+        with self._lock:
+            self._active_compute_mode = normalized
+
     def set_labels(
         self,
         input_label: Optional[str] = None,
@@ -198,19 +280,6 @@ class SharedState:
         with self._lock:
             self.latency_ms = float(max(0.0, latency_ms))
 
-    def push_alert(self, message: str) -> None:
-        cleaned = message.strip()
-        if not cleaned:
-            return
-        with self._lock:
-            self._alerts.append(message)
-
-    def pop_alert(self) -> Optional[str]:
-        with self._lock:
-            if not self._alerts:
-                return None
-            return self._alerts.pop(0)
-
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
             return {
@@ -220,6 +289,8 @@ class SharedState:
                 "input_label": self._input_label,
                 "output_label": self._output_label,
                 "kokoro_label": self._kokoro_label,
+                "compute_mode": self._requested_compute_mode,
+                "compute_mode_active": self._active_compute_mode,
             }
 
     def get_active_language(self) -> str:
@@ -242,7 +313,11 @@ class SharedState:
         with self._lock:
             return self._active_kokoro_device
 
-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+")
+    def get_active_compute_mode(self) -> str:
+        with self._lock:
+            return self._active_compute_mode
+
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 
 
 def split_sentences(text: str) -> List[str]:
@@ -275,8 +350,7 @@ class TranslatorPipeline:
         self._current_kokoro_device = state.get_active_kokoro_device()
         self._translator_cache: Dict[str, Optional[Any]] = {}
         self._language_targets = {option.code: option.target for option in LANGUAGE_OPTIONS}
-        self._kokoro_missing_notified = False
-        self._subtitle_streamer: Optional[KokoroSubtitleStreamer] = None
+        self._forced_segmenter: Optional[ForcedSegmenter] = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -298,6 +372,7 @@ class TranslatorPipeline:
         mic = self._mic
         if mic is not None:
             mic.stop()
+            self._forced_segmenter = None
         if self._thread is not None:
             self._thread.join(timeout=2.0)
         self._thread = None
@@ -327,9 +402,6 @@ class TranslatorPipeline:
         preset_key = self.state.get_active_preset()
         preset = PRESETS.get(preset_key, PRESETS["latency"])
 
-        subtitle_cfg = self.cfg.get("kokoro_subtitles", {}) or {}
-        self._subtitle_streamer = self._init_subtitle_streamer(subtitle_cfg)
-
         mic = MicReader(
             sr=input_sr,
             block_ms=self.cfg.get("vad", {}).get("frame_ms", 30),
@@ -338,16 +410,43 @@ class TranslatorPipeline:
         self._mic = mic
 
         vad_cfg = self.cfg.get("vad", {}) or {}
+        chunk_enabled = bool(vad_cfg.get("chunk_enable", False))
+        if chunk_enabled:
+            chunk_min_ms = int(vad_cfg.get("chunk_min_ms", preset.chunk_min_ms))
+            chunk_max_ms = int(vad_cfg.get("chunk_max_ms", preset.chunk_max_ms))
+            chunk_hop_ms = int(vad_cfg.get("chunk_hop_ms", preset.hop_ms))
+        else:
+            chunk_min_ms = None
+            chunk_max_ms = None
+            chunk_hop_ms = None
+        listen_max_sec = vad_cfg.get("listen_max_sec")
+        max_utt_sec = float(listen_max_sec if listen_max_sec is not None else vad_cfg.get("max_utterance_sec", 9.0))
+        silence_end_ms = int(vad_cfg.get("listen_silence_ms", vad_cfg.get("silence_end_ms", 400)))
+
+        force_cfg = vad_cfg.get("force", {}) or {}
+        if isinstance(force_cfg, dict) and force_cfg.get("enable"):
+            self._forced_segmenter = ForcedSegmenter(
+                frame_ms=int(vad_cfg.get("frame_ms", 30)),
+                cfg=ForcedSegmentConfig(
+                    threshold_dbfs=float(force_cfg.get("rms_speech_threshold_dbfs", -33.0)),
+                    min_segment_ms=int(force_cfg.get("min_forced_segment_ms", 2000)),
+                    sustained_loud_ms=int(force_cfg.get("sustained_loud_ms", 7000)),
+                    max_buffer_ms=int(force_cfg.get("max_buffer_ms", 20000)),
+                ),
+            )
+        else:
+            self._forced_segmenter = None
+
         vad = VADSegmenter(
             sr=input_sr,
-            frame_ms=vad_cfg.get("frame_ms", 30),
-            aggressiveness=vad_cfg.get("aggressiveness", 2),
-            min_speech_sec=vad_cfg.get("min_speech_sec", 0.30),
-            max_utt_sec=vad_cfg.get("max_utterance_sec", 9.0),
-            silence_end_ms=vad_cfg.get("silence_end_ms", 400),
-            chunk_min_ms=preset.chunk_min_ms,
-            chunk_max_ms=preset.chunk_max_ms,
-            chunk_hop_ms=preset.hop_ms,
+            frame_ms=int(vad_cfg.get("frame_ms", 30)),
+            aggressiveness=int(vad_cfg.get("aggressiveness", 2)),
+            min_speech_sec=float(vad_cfg.get("min_speech_sec", 0.30)),
+            max_utt_sec=max_utt_sec,
+            silence_end_ms=silence_end_ms,
+            chunk_min_ms=chunk_min_ms,
+            chunk_max_ms=chunk_max_ms,
+            chunk_hop_ms=chunk_hop_ms,
         )
 
         preproc = AudioPreprocessor(target_sr=16000, highpass_hz=90.0, lowpass_hz=7200.0)
@@ -420,17 +519,16 @@ class TranslatorPipeline:
             except Exception:
                 logger.debug("Failed to flush TTS on shutdown", exc_info=True)
             mic.stop()
-            if self._subtitle_streamer is not None:
-                try:
-                    self._subtitle_streamer.close()
-                except Exception:
-                    logger.debug("Failed to close Kokoro subtitle streamer", exc_info=True)
-                self._subtitle_streamer = None
+            self._forced_segmenter = None
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
     def _collect_segments(self, vad: VADSegmenter, frame: bytes) -> List[bytes]:
+        forced = self._forced_segmenter
+        forced_segment: Optional[bytes] = None
+        if forced is not None:
+            forced_segment = forced.push(frame)
         segments: List[bytes] = []
         first = vad.push(frame)
         if first is not None:
@@ -440,6 +538,11 @@ class TranslatorPipeline:
             if pending is None:
                 break
             segments.append(pending)
+        if segments:
+            if forced is not None:
+                forced.reset()
+        elif forced_segment is not None:
+            segments.append(forced_segment)
         return segments
 
     async def _handle_segment(
@@ -460,6 +563,7 @@ class TranslatorPipeline:
         asr_elapsed = (time.perf_counter() - asr_start) * 1000.0
         if not text:
             return
+        logger.info("Whisper transcript (%.1f ms): %s", asr_elapsed, text)
         sentences = split_sentences(text)
         if not sentences:
             sentences = [text]
@@ -476,29 +580,19 @@ class TranslatorPipeline:
             if self._should_skip_non_english(sentence, active_language):
                 logger.info("Skipping TTS because text is not English after translation: %s", sentence)
                 continue
-            self._stream_subtitle(sentence, per_sentence_ms, active_language)
             speak_start = time.perf_counter()
             try:
                 tts.synth_to_play(sentence, src_duration_ms=per_sentence_ms)
-            except MissingKokoroModelError as exc:
-                self._handle_missing_kokoro_model(exc)
-                return
             except Exception:
                 logger.exception("Kokoro playback failed")
                 break
-            tts_elapsed_total += (time.perf_counter() - speak_start) * 1000.0
+            speak_elapsed_ms = (time.perf_counter() - speak_start) * 1000.0
+            tts_elapsed_total += speak_elapsed_ms
+            logger.info("Kokoro synthesis/playback (%.1f ms): %s", speak_elapsed_ms, sentence)
         total_latency = asr_elapsed + tts_elapsed_total
         self._latency_history.append(total_latency)
         avg_latency = sum(self._latency_history) / len(self._latency_history)
         self.state.update_latency(avg_latency)
-
-    def _handle_missing_kokoro_model(self, exc: MissingKokoroModelError) -> None:
-        if self._kokoro_missing_notified:
-            return
-        self._kokoro_missing_notified = True
-        logger.error("Kokoro model missing: %s", exc)
-        self.state.push_alert(str(exc))
-        self._stop_event.set()
 
     def _normalize_language(self, language: Optional[str]) -> str:
         if not language:
@@ -533,7 +627,7 @@ class TranslatorPipeline:
         try:
             translated = translator.translate(text)
         except Exception:
-            logger.warning("Translator %s→en failed", normalized, exc_info=True)
+            logger.warning("Translator %s failed", normalized, exc_info=True)
             return text
         return translated or text
 
@@ -543,52 +637,6 @@ class TranslatorPipeline:
         if target != "en":
             return False
         return contains_cjk(text)
-
-    def _stream_subtitle(
-        self,
-        text: str,
-        per_sentence_ms: Optional[float],
-        language: Optional[str],
-    ) -> None:
-        streamer = self._subtitle_streamer
-        if streamer is None:
-            return
-        normalized_source = self._normalize_language(language)
-        target_language = self._language_targets.get(normalized_source, "en")
-        try:
-            streamer.submit(
-                text,
-                duration_ms=per_sentence_ms,
-                source_language=normalized_source or None,
-                target_language=target_language,
-            )
-        except Exception:
-            logger.debug("Failed to push Kokoro subtitle", exc_info=True)
-
-    def _init_subtitle_streamer(self, cfg: Dict[str, Any]) -> Optional[KokoroSubtitleStreamer]:
-        if not cfg or not bool(cfg.get("enabled")):
-            return None
-        endpoint = str(cfg.get("endpoint", "")).strip()
-        if not endpoint:
-            return None
-        try:
-            headers_cfg = cfg.get("headers") or {}
-            headers: Dict[str, str] = {}
-            if isinstance(headers_cfg, dict):
-                headers = {str(key): str(value) for key, value in headers_cfg.items()}
-            stream_cfg = SubtitleStreamConfig(
-                endpoint=endpoint,
-                method=str(cfg.get("method", "POST") or "POST"),
-                timeout_sec=float(cfg.get("timeout_sec", 2.0) or 2.0),
-                include_timestamps=bool(cfg.get("include_timestamps", True)),
-                retry_limit=int(cfg.get("retry_limit", 1) or 0),
-                retry_backoff_sec=float(cfg.get("retry_backoff_sec", 0.5) or 0.5),
-                headers=headers,
-            )
-            return KokoroSubtitleStreamer(stream_cfg)
-        except Exception:
-            logger.exception("Failed to initialize Kokoro subtitle streamer")
-            return None
 
     def _apply_configuration(self, vad: VADSegmenter, asr: ASR, tts: KokoroTTS) -> None:
         cfg = self.state.get_configuration()
@@ -689,3 +737,13 @@ class TranslatorPipeline:
         except Exception:
             logger.exception("Failed to initialize voice changer client")
             return None
+
+
+
+
+
+
+
+
+
+

@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import asyncio
@@ -20,18 +20,18 @@ logger = logging.getLogger("vc-translator.main")
 
 
 def _deep_merge(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
+    merged: Dict[str, Any] = {}
     keys = set(a.keys()) | set(b.keys())
     for key in keys:
-        va = a.get(key)
-        vb = b.get(key)
-        if isinstance(va, dict) and isinstance(vb, dict):
-            out[key] = _deep_merge(va, vb)
-        elif vb is None:
-            out[key] = va
+        left = a.get(key)
+        right = b.get(key)
+        if isinstance(left, dict) and isinstance(right, dict):
+            merged[key] = _deep_merge(left, right)
+        elif right is None:
+            merged[key] = left
         else:
-            out[key] = vb if vb is not None else va
-    return out
+            merged[key] = right if right is not None else left
+    return merged
 
 
 def select_input_device_gui(current: Optional[object] = None) -> Optional[int]:
@@ -39,7 +39,7 @@ def select_input_device_gui(current: Optional[object] = None) -> Optional[int]:
         import tkinter as tk
         from tkinter import ttk, messagebox
     except Exception as exc:  # pragma: no cover - GUI fallback
-        print(f"GUI not available for device selection: {exc}")
+        logger.error("GUI not available for device selection: %s", exc)
         return None
 
     devices = sd.query_devices()
@@ -49,9 +49,8 @@ def select_input_device_gui(current: Optional[object] = None) -> Optional[int]:
             name = info.get("name", f"Device {idx}")
             label = f"[{idx}] {name} (in={info['max_input_channels']}, out={info['max_output_channels']})"
             candidates.append((idx, label))
-
     if not candidates:
-        print("No input devices found.")
+        logger.error("No input devices found.")
         return None
 
     root = tk.Tk()
@@ -121,7 +120,7 @@ def select_output_device_gui(
         import tkinter as tk
         from tkinter import ttk, messagebox
     except Exception as exc:  # pragma: no cover - GUI fallback
-        print(f"GUI not available for device selection: {exc}")
+        logger.error("GUI not available for device selection: %s", exc)
         return None
 
     devices = sd.query_devices()
@@ -131,9 +130,8 @@ def select_output_device_gui(
             name = info.get("name", f"Device {idx}")
             label = f"[{idx}] {name} (in={info['max_input_channels']}, out={info['max_output_channels']})"
             candidates.append((idx, label))
-
     if not candidates:
-        print("No output devices found.")
+        logger.error("No output devices found.")
         return None
 
     root = tk.Tk()
@@ -221,21 +219,83 @@ def _save_devices_local(
     input_dev: Optional[object],
     output_dev: Optional[object],
     kokoro_dev: Optional[object],
+    compute_mode: Optional[str] = None,
 ) -> None:
     base_dir = os.path.dirname(cfg_path)
     local_path = os.path.join(base_dir, "local.toml")
-    data: Dict[str, Dict[str, Any]] = {}
-    device_section: Dict[str, Any] = {}
-    if input_dev is not None:
-        device_section["input_device"] = parse_sd_device(input_dev)
-    if output_dev is not None:
-        device_section["output_device"] = parse_sd_device(output_dev)
+
+    existing: Dict[str, Any] = {}
+    if os.path.isfile(local_path):
+        try:
+            with open(local_path, "rb") as fh:
+                existing = tomli.load(fh)
+        except Exception:
+            logger.debug("Failed to read %s while saving devices", local_path, exc_info=True)
+            existing = {}
+
+    data: Dict[str, Any] = {}
+    for key, value in existing.items():
+        if isinstance(value, dict):
+            data[key] = value.copy()
+        else:
+            data[key] = value
+
+    def _normalize_device(value: Optional[object]) -> Optional[object]:
+        if value in (None, "", "default"):
+            return None
+        return parse_sd_device(value)
+
+    device_section = data.get("device", {}) if isinstance(data.get("device"), dict) else {}
+    device_section = device_section.copy() if isinstance(device_section, dict) else {}
+    normalized_input = _normalize_device(input_dev)
+    normalized_output = _normalize_device(output_dev)
+
+    if normalized_input is not None:
+        device_section["input_device"] = normalized_input
+    elif "input_device" in device_section:
+        device_section.pop("input_device")
+
+    if normalized_output is not None:
+        device_section["output_device"] = normalized_output
+    elif "output_device" in device_section:
+        device_section.pop("output_device")
+
     if device_section:
         data["device"] = device_section
-    if kokoro_dev is not None:
-        data.setdefault("kokoro", {})["passthrough_input_device"] = parse_sd_device(kokoro_dev)
+    else:
+        data.pop("device", None)
+
+    kokoro_section = data.get("kokoro", {}) if isinstance(data.get("kokoro"), dict) else {}
+    kokoro_section = kokoro_section.copy() if isinstance(kokoro_section, dict) else {}
+    normalized_kokoro = _normalize_device(kokoro_dev)
+
+    if normalized_kokoro is not None:
+        kokoro_section["passthrough_input_device"] = normalized_kokoro
+    elif "passthrough_input_device" in kokoro_section:
+        kokoro_section.pop("passthrough_input_device")
+
+    if kokoro_section:
+        data["kokoro"] = kokoro_section
+    else:
+        data.pop("kokoro", None)
+
+    app_section = data.get("app", {}) if isinstance(data.get("app"), dict) else {}
+    app_section = app_section.copy() if isinstance(app_section, dict) else {}
+    if compute_mode is not None:
+        app_section["compute_mode"] = compute_mode
+    if app_section:
+        data["app"] = app_section
+    else:
+        data.pop("app", None)
+
     if not data:
+        if os.path.exists(local_path):
+            try:
+                os.remove(local_path)
+            except Exception:
+                logger.debug("Failed to remove %s", local_path, exc_info=True)
         return
+
     try:
         os.makedirs(base_dir, exist_ok=True)
         with open(local_path, "wb") as fh:
@@ -273,6 +333,8 @@ def apply_overrides(cfg: Dict[str, Any], args: argparse.Namespace) -> Dict[str, 
         asr_cfg["language"] = args.language
     if getattr(args, "preset", None):
         app_cfg["preset"] = args.preset
+    if getattr(args, "compute_mode", None):
+        app_cfg["compute_mode"] = args.compute_mode
     return merged
 
 
@@ -293,7 +355,7 @@ def print_devices() -> None:
 
 async def list_edge_voices() -> None:
     try:
-        import edge_tts
+        import edge_tts  # type: ignore
     except Exception as exc:  # pragma: no cover - optional dependency
         print(f"edge-tts not installed or failed to import: {exc}")
         return
@@ -302,6 +364,41 @@ async def list_edge_voices() -> None:
     for voice in voices:
         if voice.get("Locale", "").startswith("en-"):
             print(f"  {voice['ShortName']}  ({voice['Gender']}, {voice['Locale']})")
+
+
+def _configure_acceleration(cfg: Dict[str, Any], preferred: str) -> tuple[str, str]:
+    asr_cfg = cfg.setdefault("asr", {})
+    kokoro_cfg = cfg.setdefault("kokoro", {})
+    try:
+        import torch  # type: ignore
+        cuda_available = bool(torch.cuda.is_available())
+    except Exception:
+        cuda_available = False
+
+    mode = (preferred or "auto").strip().lower()
+    if mode not in {"auto", "cpu", "cuda"}:
+        mode = "auto"
+
+    effective = mode
+    if mode == "auto":
+        effective = "cuda" if cuda_available else "cpu"
+    elif mode == "cuda" and not cuda_available:
+        effective = "cpu"
+
+    if effective == "cuda":
+        asr_cfg["device"] = "cuda"
+        asr_cfg["compute_type"] = "float16"
+        kokoro_cfg["device"] = "cuda"
+        kokoro_cfg["use_half"] = True
+    else:
+        asr_cfg["device"] = "cpu"
+        asr_cfg["compute_type"] = "int8"
+        if str(kokoro_cfg.get("device", "")).strip().lower() == "cuda":
+            kokoro_cfg["device"] = "auto"
+        kokoro_cfg.setdefault("use_half", False)
+
+    stored = "auto" if mode == "auto" else effective
+    return stored, effective
 
 
 def run_app(cfg_path: str, args: Optional[argparse.Namespace]) -> None:
@@ -313,6 +410,12 @@ def run_app(cfg_path: str, args: Optional[argparse.Namespace]) -> None:
     asr_cfg = cfg.setdefault("asr", {})
     app_cfg = cfg.setdefault("app", {})
     kokoro_cfg = cfg.setdefault("kokoro", {})
+
+    preferred_mode = str(app_cfg.get("compute_mode", "auto") or "auto").strip().lower()
+    stored_mode, effective_mode = _configure_acceleration(cfg, preferred_mode)
+    if preferred_mode == "cuda" and effective_mode != "cuda":
+        logger.warning("CUDA requested but not available; falling back to CPU mode")
+    app_cfg["compute_mode"] = stored_mode
 
     language = asr_cfg.get("language", "ko")
     supported_languages = {option.code for option in LANGUAGE_OPTIONS}
@@ -349,7 +452,7 @@ def run_app(cfg_path: str, args: Optional[argparse.Namespace]) -> None:
     output_label = describe_device(output_device)
     kokoro_label = describe_optional_device(kokoro_passthrough)
     kokoro_save = kokoro_passthrough if kokoro_passthrough not in ("",) else None
-    _save_devices_local(cfg_path, input_device, output_device, kokoro_save)
+    _save_devices_local(cfg_path, input_device, output_device, kokoro_save, stored_mode)
 
     state = SharedState(
         language,
@@ -360,13 +463,15 @@ def run_app(cfg_path: str, args: Optional[argparse.Namespace]) -> None:
         output_label,
         kokoro_passthrough,
         kokoro_label,
+        stored_mode,
     )
+    state.set_active_compute_mode(effective_mode)
     state.set_labels(input_label, output_label, kokoro_label)
 
     def save_devices_callback(
         inp: Optional[object], out: Optional[object], kokoro: Optional[object]
     ) -> None:
-        _save_devices_local(cfg_path, inp, out, kokoro)
+        _save_devices_local(cfg_path, inp, out, kokoro, state.get_active_compute_mode())
 
     pipeline = TranslatorPipeline(cfg, state, save_devices_callback)
 
@@ -393,10 +498,56 @@ def run_app(cfg_path: str, args: Optional[argparse.Namespace]) -> None:
         label = describe_device(selected)
         state.request_kokoro_device(selected, label)
 
+    stored_mode_ref = stored_mode
+    effective_mode_ref = effective_mode
+
+    def on_change_compute_mode(mode: str) -> None:
+        nonlocal pipeline, stored_mode_ref, effective_mode_ref
+        normalized = (mode or "auto").strip().lower()
+        stored_choice, effective_choice = _configure_acceleration(cfg, normalized)
+        requested_value = normalized if normalized == "auto" else stored_choice
+        state.request_compute_mode(requested_value)
+        if normalized == "cuda" and effective_choice != "cuda":
+            try:
+                from tkinter import messagebox
+
+                messagebox.showinfo("가속 모드", "CUDA를 사용할 수 없어 CPU로 전환했습니다.")
+            except Exception:
+                logger.info("CUDA not available; falling back to CPU mode")
+        app_cfg["compute_mode"] = requested_value if requested_value == "auto" else stored_choice
+        state.set_active_compute_mode(effective_choice)
+        stored_mode_ref = app_cfg["compute_mode"]
+        effective_mode_ref = effective_choice
+        _save_devices_local(
+            cfg_path,
+            state.get_active_input_device(),
+            state.get_active_output_device(),
+            state.get_active_kokoro_device(),
+            stored_mode_ref,
+        )
+        pipeline.stop()
+        pipeline = TranslatorPipeline(cfg, state, save_devices_callback)
+        pipeline.start()
+
+    def on_sync_kokoro_to_output() -> None:
+        target = state.get_active_output_device()
+        if target is None:
+            return
+        label = describe_device(target)
+        state.request_kokoro_device(target, label)
+
     def on_close() -> None:
         pipeline.stop()
 
-    ui = TranslatorUI(state, on_change_input, on_change_output, on_change_kokoro, on_close)
+    ui = TranslatorUI(
+        state,
+        on_change_input,
+        on_change_output,
+        on_change_kokoro,
+        on_change_compute_mode,
+        on_sync_kokoro_to_output,
+        on_close,
+    )
     pipeline.start()
     try:
         ui.run()
@@ -411,12 +562,9 @@ def _build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--list-voices", action="store_true", help="List Edge TTS voices (network) and exit")
     parser.add_argument("--input-device", help="Input device index or name")
     parser.add_argument("--output-device", help="Output device index or name")
-    parser.add_argument(
-        "--language",
-        choices=[option.code for option in LANGUAGE_OPTIONS],
-        help="Force input language",
-    )
+    parser.add_argument("--language", choices=[option.code for option in LANGUAGE_OPTIONS], help="Force input language")
     parser.add_argument("--preset", choices=list(PRESETS.keys()), help="Select processing preset")
+    parser.add_argument("--compute-mode", choices=["auto", "cpu", "cuda"], help="Override compute mode")
     return parser
 
 

@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Optional, Tuple
 
 import logging
+import ctypes
+import ctypes.util
 import shutil
 import subprocess
 
 import numpy as np
+from pathlib import Path
 import pyloudnorm as pyln
 
 from .utils import float32_to_int16, int16_to_float32, resample_audio
@@ -16,6 +19,104 @@ from .utils import float32_to_int16, int16_to_float32, resample_audio
 
 logger = logging.getLogger(__name__)
 
+
+_RNNOISE_WARNED = False
+
+
+def _load_rnnoise_library() -> Optional[ctypes.CDLL]:
+    if ctypes is None:
+        return None
+    candidates: list[str] = []
+    lib_name = ctypes.util.find_library("rnnoise")
+    if lib_name:
+        candidates.append(lib_name)
+    base_dir = Path(__file__).resolve().parent
+    for candidate in ("rnnoise.dll", "librnnoise.so", "librnnoise.dylib"):
+        candidates.append(str(base_dir / candidate))
+        candidates.append(candidate)
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        try:
+            return ctypes.cdll.LoadLibrary(candidate)
+        except OSError:
+            continue
+    return None
+
+
+_RNNOISE_LIB = _load_rnnoise_library()
+
+
+class _RNNoiseEffect:
+    """Thin ctypes wrapper around the optional RNNoise library."""
+
+    FRAME_SIZE = 480
+    SAMPLE_RATE = 48000
+
+    def __init__(self) -> None:
+        if _RNNOISE_LIB is None:
+            raise RuntimeError("RNNoise library is not available")
+        self._lib = _RNNOISE_LIB
+        self._lib.rnnoise_create.argtypes = [ctypes.c_void_p]
+        self._lib.rnnoise_create.restype = ctypes.c_void_p
+        self._lib.rnnoise_destroy.argtypes = [ctypes.c_void_p]
+        self._lib.rnnoise_destroy.restype = None
+        self._lib.rnnoise_process_frame.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.POINTER(ctypes.c_float),
+        ]
+        self._lib.rnnoise_process_frame.restype = ctypes.c_float
+        try:
+            state_ptr = self._lib.rnnoise_create(None)
+        except Exception as exc:
+            raise RuntimeError("rnnoise_create failed") from exc
+        if not state_ptr:
+            raise RuntimeError("rnnoise_create returned NULL state")
+        self._state = ctypes.c_void_p(state_ptr)
+        if hasattr(self._lib, "rnnoise_get_frame_size"):
+            try:
+                frame_size = int(self._lib.rnnoise_get_frame_size())
+            except Exception:
+                frame_size = self.FRAME_SIZE
+            if frame_size > 0:
+                self.frame_size = frame_size
+            else:
+                self.frame_size = self.FRAME_SIZE
+        else:
+            self.frame_size = self.FRAME_SIZE
+        self.sample_rate = self.SAMPLE_RATE
+
+    def close(self) -> None:
+        if getattr(self, "_state", None):
+            try:
+                self._lib.rnnoise_destroy(self._state)
+            finally:
+                self._state = None
+
+    def process(self, audio: np.ndarray, sample_rate: int) -> Tuple[np.ndarray, int]:
+        if audio.size == 0:
+            return audio.astype(np.float32, copy=False), sample_rate
+        arr = np.asarray(audio, dtype=np.float32)
+        sr = int(sample_rate)
+        if sr != self.sample_rate:
+            arr = resample_audio(arr, sr, self.sample_rate)
+            sr = self.sample_rate
+        frame = int(self.frame_size)
+        pad = (frame - (arr.size % frame)) % frame
+        if pad:
+            arr = np.pad(arr, (0, pad), mode="constant")
+        out = np.empty_like(arr, dtype=np.float32)
+        in_ptr = arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        out_ptr = out.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        state = self._state
+        for offset in range(0, arr.size, frame):
+            self._lib.rnnoise_process_frame(state, out_ptr + offset, in_ptr + offset)
+        if pad:
+            out = out[:-pad]
+        return out.astype(np.float32, copy=False), sr
 
 class _BiquadFilter:
     """Simple biquad filter with persistent state for mono signals."""
@@ -261,4 +362,10 @@ class AudioPreprocessor:
                 gain = (threshold / env) ** (ratio - 1.0)
             out[idx] = float(sample) * gain
         return out
+
+
+
+
+
+
 

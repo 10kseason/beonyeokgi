@@ -5,12 +5,12 @@ input_device = ""
 output_device = ""
 
 [asr]
-whisper_model = "medium" # recommended: large-v3-turbo for accuracy, medium for lower load
+whisper_model = "medium" #정확도 높은 방식 :large-v3-turbo #성능 방식  : medium #모델 알아서 선택하세요
 device = "cuda"
 compute_type = "int8"
 task = "translate"
 language = "ko"
-beam_size = 3
+beam_size = 1
 temperature = 0.0
 vad = true
 
@@ -18,24 +18,14 @@ vad = true
 frame_ms = 30
 aggressiveness = 3
 min_speech_sec = 0.30
-silence_pad_ms = 400
-max_segment_ms = 9000
-chunk_enable = false
-# ---- Forced Segmentation (when VAD misses speech) ----
-[vad.force]
-enable = false
-rms_speech_threshold_dbfs = -33.0  # >= this is considered speech-like
-min_forced_segment_ms = 2000      # minimum duration to cut on loud->quiet
-sustained_loud_ms = 7000          # force if loud this long with no VAD end
-max_buffer_ms = 20000             # cap buffer
-
+silence_end_ms = 400
 
 [tts]
 engine = "kokoro"
 voice = "en-US-AriaNeural"
 piper_model = ""
 pace = 1.0
-volume_db = 13.4
+volume_db = 10.3
 
 [kokoro]
 model = "hexgrad/Kokoro-82M"
@@ -58,11 +48,11 @@ short_idle_flush_ms = 500.0
 warmup_runs = 2
 
 [app]
-preset = "accuracy"
+preset = "latency"
 
 [stream]
 mode = "chunk"
-normalize_dbfs = -2.5
+normalize_dbfs = -16
 
 [voice_changer]
 enabled = false
@@ -80,4 +70,3 @@ stream_chunk_ms = 1000
 
 [logging]
 level = "INFO"
-
