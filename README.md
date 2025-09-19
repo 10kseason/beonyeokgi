@@ -1,94 +1,50 @@
-Realtime Speech Translator (Windows)
+# Realtime Speech Translator (Windows)
 
-- Real-time mic capture ??VAD chunking ??Whisper translate (ko/ja/zh ??en) ??Kokoro 82M TTS playback.
-- Deterministic 16 kHz preprocessing (loudness normalization, 90 Hz high-pass, 7.2 kHz low-pass) and filler removal for Korean (????그니?.
-- Single-page desktop UI showing mic/output/Kokoro routing, fixed language pairs (ko/ja/zh ??EN), a latency gauge, and preset selector.
-- Optimized for Windows + VB-CABLE to feed TTS into a Discord voice channel.
+## Overview
+- Captures mono 16-bit PCM audio from the selected input device, segments speech with WebRTC VAD (plus optional forced segmentation), normalizes the audio, runs Faster-Whisper with filler removal and fallback translation, then synthesizes Kokoro 82M speech with optional voice conversion and multi-device playback.【F:src/audio_io.py†L10-L76】【F:src/vad.py†L19-L177】【F:src/preprocess.py†L192-L340】【F:src/asr.py†L29-L117】【F:src/pipeline.py†L331-L595】【F:src/tts_kokoro.py†L120-L366】
+- Runtime state (language, preset, devices, latency) is coordinated by a background pipeline thread so the Tk UI can update labels, latency gauges, and device choices without blocking audio processing.【F:src/pipeline.py†L144-L695】【F:src/ui.py†L10-L195】
 
-Quickstart
+## Documentation
+- [English technical overview](docs/overview.en.md)
+- [한국어 문서](docs/overview.ko.md)
+- [日本語ドキュメント](docs/overview.ja.md)
 
-- Python 3.10?3.12 recommended (examples assume 3.10)
-- Windows 10/11 64-bit
-- Optional GPU: install CUDA and use faster-whisper with float16
+## Setup
+### Requirements
+- Windows 10/11 with Python 3.10+ available on `PATH`; the bootstrap script refuses to run if Python is missing or too old.【F:for_vene.bat†L4-L26】
+- Install the dependencies listed in `requirements.txt` (Faster-Whisper, WebRTC VAD wheels, sounddevice, Kokoro runtimes, Edge/Piper TTS, PyTorch, etc.).【F:requirements.txt†L1-L21】
 
-Setup
+### Windows bootstrap script
+Run `for_vene.bat` to create/update `.venv`, upgrade pip/setuptools/wheel, and install all requirements. Successful completion prints the commands needed to activate the environment later.【F:for_vene.bat†L11-L47】
 
-1) Bootstrap the virtual environment (runs safely multiple times):
-   - Double-click `for_vene.bat` or run it from `cmd`. The script creates/updates `.venv`, upgrades `pip/setuptools/wheel`, and installs everything from `requirements.txt` (CPU PyTorch by default).
-   - GPU users can edit the `--extra-index-url` line in `requirements.txt` before running the script to target a CUDA/ROCm build from the official PyTorch index.
-   - Kokoro PyTorch/ONNX runtimes are now included in `requirements.txt`, so the default TTS backend is ready after this step. Adjust or pin the package versions there if you need specific builds.
-2) Audio routing (VB-CABLE):
-   - Set default playback to `CABLE Input` (or route with Voicemeeter)
-   - In Discord, set Input device to `CABLE Output`
-   - Disable echo cancellation / noise suppression / AGC in Discord
-3) Optional: install ffmpeg if you plan to use pydub-based features (voice changer previews, etc.):
-   - Download ffmpeg and add its `bin` to PATH
+### Manual installation outline
+1. Create and activate a virtual environment (`python -m venv .venv` → `call .\.venv\Scripts\activate`).
+2. `pip install --upgrade pip setuptools wheel`.
+3. `pip install -r requirements.txt` (remove or edit the extra index if you want a CUDA/ROCm PyTorch build).【F:for_vene.bat†L22-L45】【F:requirements.txt†L1-L21】
 
-Kokoro backend
---------------
+### Optional tools
+- Add ffmpeg to `PATH` so the preprocessor can use ffmpeg-based resampling and pydub can decode MP3 responses.【F:src/preprocess.py†L239-L295】
+- Virtual audio cables (e.g., VB-CABLE) can be selected through the device picker dialogs to mirror Kokoro output to conferencing software.【F:src/main.py†L37-L188】【F:src/tts_kokoro.py†L428-L553】
 
-- The environment bootstrap installs the official Kokoro runtime packages (PyTorch and ONNX variants) from PyPI. If you prefer a custom build, edit `requirements.txt` before running the setup script or install your desired wheels afterwards.
+## Running
+1. Activate the virtual environment and start the UI with `python -m src.main`, or run `run.bat` to activate and launch in one step.【F:run.bat†L1-L5】【F:src/main.py†L571-L588】
+2. On first launch, choose microphone/output devices (and optionally a Kokoro passthrough device); selections persist in `config/local.toml`. The UI also exposes compute mode, preset toggles, and a live latency gauge.【F:src/main.py†L404-L555】【F:src/pipeline.py†L144-L318】【F:src/ui.py†L10-L195】
+3. CLI helpers:
+   - `python -m src.main --list-devices` prints available input/output devices.
+   - `python -m src.main --list-voices` fetches Edge TTS voice metadata when the optional package is installed.【F:src/main.py†L341-L367】【F:src/main.py†L558-L588】
 
-Config
+## Configuration
+All defaults live in `config/settings.toml` and can be overridden in `config/local.toml`.
+- `[device]`: Default sample rates and device identifiers saved from the UI.【F:config/settings.toml†L1-L5】【F:src/main.py†L217-L305】
+- `[asr]`: Whisper model/device/compute type, language lock, and decoding hyperparameters.【F:config/settings.toml†L7-L15】【F:src/asr.py†L29-L147】
+- `[vad]` / `[vad.force]`: VAD aggressiveness, silence padding, chunk streaming, and forced segmentation thresholds.【F:config/settings.toml†L17-L30】【F:src/vad.py†L19-L177】【F:src/pipeline.py†L405-L545】
+- `[tts]` / `[kokoro]`: Kokoro backend selection, speaker, batching/crossfade timing, output volume, passthrough input device, and warmup count.【F:config/settings.toml†L33-L58】【F:src/tts_kokoro.py†L120-L553】
+- `[app]`: Default preset (`latency` or `accuracy`) and compute mode preference; the runtime verifies CUDA availability and falls back to CPU when needed.【F:config/settings.toml†L60-L61】【F:src/main.py†L369-L530】
+- `[voice_changer]`: Disabled (`enabled = false`) by default—VCC export is inactive until you opt in. Configure base URL, endpoints, sample rates, streaming chunk size, and fallback playback device here.【F:config/settings.toml†L67-L79】【F:src/pipeline.py†L706-L739】【F:src/voice_changer_client.py†L21-L184】
 
-Edit `config/settings.toml` to adjust devices, model size, presets, and Kokoro tuning.
-Defaults:
-- Capture at the device sample rate, preprocess to 16 kHz mono with loudnorm (I=-16, TP=-1.5, LRA=11) and 90??200 Hz band-pass before Whisper.
-- Whisper `large-v3-turbo` on CPU (`int8` compute) so the ASR step stays responsive without a GPU.
-- VAD 30 ms frames, aggressiveness 2, silence tail 300 ms (streaming chunking comes from the preset values).
-- Kokoro 82M TTS with 120 ms crossfade and sentence queueing.
-- `[app].preset = "latency"` (1000??200 ms chunk, 250 ms hop, beam 3). Switch to `"accuracy"` for longer chunks and higher beam width.
+## Voice Conversion / VCC
+When `voice_changer.enabled` remains `false`, Kokoro audio is only played locally. Enabling it sends Kokoro output to the Ookada VC Client API, with optional WAV logging of original and converted audio. This increases latency slightly and requires the HTTP endpoint to be available.【F:config/settings.toml†L67-L79】【F:src/tts_kokoro.py†L320-L366】【F:src/voice_changer_client.py†L113-L184】
 
-Run
-
-- Activate venv: `.\.venv\Scripts\activate`
-- Start: `python -m src.main` (a single-window UI appears showing selected devices, fixed language toggle, preset buttons, and a live latency gauge)
-- Or use helper: `run.bat`
-
-CLI Helpers
-
-- List audio devices: `python -m src.main --list-devices`
-- List Edge TTS voices: `python -m src.main --list-voices`
-- Override common settings at launch:
-  - `--input-device "Your Mic"` or index
-  - `--output-device "CABLE Input"` or index
-  - `--language ko|ja|zh`
-  - `--preset latency|accuracy`
-  - Use `--config` to point at a different TOML file
-
-Kokoro 82M GPU TTS
-------------------
-
-- Kokoro 82M is the only TTS path (no Edge/Piper fallback). `[tts].engine` remains `"kokoro"` for completeness.
-- Backend auto-probing is enabled by default (`[kokoro].backend = "auto"`, `[kokoro].device = "auto"`). At startup the app benchmarks CUDA ??ROCm ??DirectML ??CPU with a one-second dummy sentence on the available runtimes (PyTorch or ONNX) and locks in the fastest option. If the active backend spikes above the running average by more than `2?` for three consecutive sentences it automatically falls back to the next fastest candidate.
-- Pick a Kokoro voice and set `[kokoro].speaker` (defaults to "af_bella"). Voice files follow the repository naming (`af_*`, `am_*`, `bf_*`, etc.) in `hexgrad/Kokoro-82M/voices`.
-- Device priority matches the hardware:
-  - NVIDIA GPUs stick to PyTorch + CUDA (`use_half = true` keeps FP16 inference).
-  - AMD on Linux prefers ONNX + ROCm; Windows systems without NVIDIA prefer ONNX + DirectML.
-  - CPU-only mode is kept as a final fallback when no GPU runtime is available.
-- Mirror Kokoro playback to a virtual microphone by setting `[kokoro].passthrough_input_device` to the input device index/name (e.g. the 3rd input device). Audio continues to play on the main output while also feeding the specified input.
-- To pin a specific configuration, override `[kokoro].backend`, `[kokoro].device`, or `[kokoro].onnx_providers` and rerun. CLI overrides such as `--kokoro-backend onnx` or `--kokoro-provider DmlExecutionProvider` are still supported.
-- Built-in queueing keeps playback smooth: sentences are batched until the group reaches roughly 0.8??.2?s, a fixed 120?ms crossfade blends consecutive utterances, and short clips flush automatically when speech pauses. The tunables (`short_threshold_ms`, `min_batch_ms`, `max_batch_ms`, `crossfade_ms`, etc.) live under `[kokoro]` if you need to tweak them.
-- Kokoro playback is skipped automatically if translation fails and non-English (Hangul/Kana/Han) characters remain after the fallback translator pass.
-- `[kokoro].passthrough_input_device` can now be set directly from the UI ("Kokoro 출력" row) instead of editing the config file.
-
-Voice Changer Integration
-
-- Default run saves the raw Kokoro waveform to `cache/tts_original.wav`.
-- Set `[voice_changer].enabled = true` in `config/settings.toml` to pipe each utterance into Ookada's VCClient at `http://localhost:18000` via the `/api/voice-changer/convert_chunk` endpoint.
-- When enabled, the converted audio replaces the playback stream and is also written to `cache/tts_converted.wav`. The client auto-detects sample rates from `/api/configuration-manager/configuration`; override `input_sample_rate`/`output_sample_rate` if you need fixed values.
-- Tune `timeout_sec`, `base_url`, or `endpoint` to match your VCClient deployment. If the HTTP call fails, the app logs the reason, optionally retries `/api/voice-changer/convert_chunk_bulk`, and falls back to the original TTS audio.
-- Optional streaming: set `[voice_changer].stream_mode = true` to send smaller chunks (default 1000 ms, configure with `stream_chunk_ms`) so converted audio starts while later chunks process.
-
-Notes
-
-- Translation to English is enforced for the supported input languages (ko/ja/zh). Whisper handles the primary translation and, if residual CJK text remains, the app falls back to the Helsinki-NLP ko/ja/zh ??en models before speaking.
-- If audio plays too loud/quiet, tune `[tts].volume_db` and `[stream].normalize_dbfs`.
-- Whisper �?�� 길이�??�리�??�다�?[vad].listen_max_sec, [vad].listen_silence_ms, chunk_min_ms, chunk_max_ms�?조정???�그먼트 분할 ?�점????�� ???�습?�다.
-- Set `[logging].level = "DEBUG"` to enable per-segment ASR/TTS timing logs while tuning performance.
-- For CPU-only, set `[asr].device = "cpu"` and `compute_type = "int8"` or `"int8_float16"`.
-- For Piper TTS, set `[tts].engine = "piper"` and provide `[tts].piper_model` path to a `.onnx` or `.tar` bundle, then install Piper models separately.
-- Korean fillers (`??, `??, `그니?) are stripped before translation so Whisper/Kokoro only see meaningful speech.
-
-
-
+## Tips
+- Switch compute acceleration at launch with `--compute-mode auto|cpu|cuda`; requests for CUDA gracefully fall back to CPU if CUDA is unavailable.【F:src/main.py†L369-L530】
+- Extend `LANGUAGE_OPTIONS` and `LANGUAGE_MODELS` to support additional source languages—the shared state and UI already handle dynamic language switching.【F:src/pipeline.py†L39-L655】【F:src/translator.py†L10-L73】【F:src/ui.py†L84-L153】
