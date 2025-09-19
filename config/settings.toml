@@ -23,7 +23,7 @@ max_segment_ms = 9000
 chunk_enable = false
 # ---- Forced Segmentation (when VAD misses speech) ----
 [vad.force]
-enable = false
+enable = true
 rms_speech_threshold_dbfs = -33.0  # >= this is considered speech-like
 min_forced_segment_ms = 2000      # minimum duration to cut on loud->quiet
 sustained_loud_ms = 7000          # force if loud this long with no VAD end
