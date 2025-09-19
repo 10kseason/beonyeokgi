@@ -56,6 +56,7 @@ class ASR:
         self._translator: Optional["KoEnTranslator"] = None
         self._translator_init_failed = False
         self._use_post_translate = False
+        self._force_transcribe = False
         self._base_task = task
         self.set_language(language)
 
@@ -92,7 +93,7 @@ class ASR:
         data_f32 = self._resample_to_16k(data_f32)
         if data_f32.size == 0:
             return ""
-        task = "transcribe" if self._use_post_translate else self._base_task
+        task = "transcribe" if (self._use_post_translate or self._force_transcribe) else self._base_task
         segments, _ = self.model.transcribe(
             data_f32,
             language=self.cfg.language,
@@ -106,7 +107,7 @@ class ASR:
             return ""
         if self._use_post_translate or (self.cfg.language and str(self.cfg.language).lower().startswith("ko")):
             text = remove_korean_fillers(text)
-        if self._use_post_translate and self._translator is not None:
+        if self._use_post_translate and not self._force_transcribe and self._translator is not None:
             try:
                 return self._translator.translate(text)
             except Exception as exc:
@@ -119,8 +120,27 @@ class ASR:
     def set_language(self, language: Optional[str]) -> None:
         normalized = (language or "").strip().lower()
         self.cfg.language = normalized or None
+        self._refresh_post_translate_flag()
+
+    def set_decoding_options(self, beam_size: int, temperature: float) -> None:
+        self.cfg.beam_size = max(1, int(beam_size))
+        self.cfg.temperature = float(max(0.0, temperature))
+
+    def set_force_transcribe(self, enabled: bool) -> None:
+        value = bool(enabled)
+        if value == self._force_transcribe:
+            return
+        self._force_transcribe = value
+        if value:
+            self._use_post_translate = False
+        else:
+            self._refresh_post_translate_flag()
+
+    def _refresh_post_translate_flag(self) -> None:
+        normalized = (self.cfg.language or "").strip().lower() if self.cfg.language else ""
         wants_translator = (
             self._base_task.lower() == "translate"
+            and not self._force_transcribe
             and normalized in {"ko", "ko-kr", "korean"}
         )
         if wants_translator and KoEnTranslator is not None:
@@ -142,7 +162,3 @@ class ASR:
                 )
                 self._translator_init_failed = True
             self._use_post_translate = False
-
-    def set_decoding_options(self, beam_size: int, temperature: float) -> None:
-        self.cfg.beam_size = max(1, int(beam_size))
-        self.cfg.temperature = float(max(0.0, temperature))
