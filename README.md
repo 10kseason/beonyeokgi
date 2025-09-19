@@ -5,6 +5,8 @@
 - Runtime state (language, preset, devices, latency) is coordinated by a background pipeline thread so the Tk UI can update labels, latency gauges, and device choices without blocking audio processing.【F:src/pipeline.py†L144-L695】【F:src/ui.py†L10-L195】
 
 [![Watch the video](preview.gif)](https://youtu.be/2mpViP17BnQ)
+
+
 Click on the GIF to go to the YouTube video.
 
 ## Documentation
