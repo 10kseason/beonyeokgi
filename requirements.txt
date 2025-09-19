@@ -1,4 +1,4 @@
---extra-index-url https://download.pytorch.org/whl/cpu
+--extra-index-url https://download.pytorch.org/whl/cu121
 # Default CPU wheels for PyTorch; adjust or remove the extra index for GPU-specific builds.
 faster-whisper>=1.0.0
 webrtcvad-wheels>=2.0.10.post2
