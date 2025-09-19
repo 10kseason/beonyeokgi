@@ -61,8 +61,8 @@ warmup_runs = 2
 preset = "accuracy"
 
 [translator]
-use_llm = false
-llm_backend = "ollama"  # ollama | lmstudio
+use_llm = true
+llm_backend = "lmstudio"  # ollama | lmstudio
 timeout_sec = 8.0
 temperature = 0.2
 
@@ -72,7 +72,7 @@ model = ""
 
 [translator.lmstudio]
 base_url = "http://localhost:1234/v1"
-model = ""
+model = "qwen/qwen3-4b-2507"
 
 [stream]
 mode = "chunk"
