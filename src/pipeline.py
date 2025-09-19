@@ -18,7 +18,7 @@ from .preprocess import AudioPreprocessor
 from .llm_translator import LLMTranslator, LLMTranslatorConfig
 from .kokoro_subtitles import KokoroSubtitleStreamer, SubtitleStreamConfig
 from .tts_kokoro import KokoroTTS
-from .utils import contains_cjk, parse_sd_device
+from .utils import contains_cjk, detect_max_cuda_vram_gb, parse_sd_device
 from .vad import VADSegmenter
 from .voice_changer_client import VoiceChangerClient, VoiceChangerConfig
 
@@ -440,6 +440,8 @@ class TranslatorPipeline:
         self._current_output_device = output_device
         self._current_kokoro_device = kokoro_passthrough
 
+        detected_vram_gb = detect_max_cuda_vram_gb()
+
         preset_key = self.state.get_active_preset()
         preset = PRESETS.get(preset_key, PRESETS["latency"])
 
@@ -493,10 +495,38 @@ class TranslatorPipeline:
         preproc = AudioPreprocessor(target_sr=16000, highpass_hz=90.0, lowpass_hz=7200.0)
 
         asr_cfg = self.cfg.get("asr", {}) or {}
+
+        raw_device = asr_cfg.get("device")
+        if isinstance(raw_device, str):
+            device_clean = raw_device.strip()
+            asr_device = device_clean or "cuda"
+        elif raw_device:
+            asr_device = str(raw_device)
+        else:
+            asr_device = "cuda"
+
+        raw_compute_type = asr_cfg.get("compute_type")
+        if isinstance(raw_compute_type, str):
+            compute_clean = raw_compute_type.strip()
+            asr_compute_type = compute_clean or "float16"
+        elif raw_compute_type:
+            asr_compute_type = str(raw_compute_type)
+        else:
+            asr_compute_type = "float16"
+
+        device_lower = asr_device.lower() if isinstance(asr_device, str) else str(asr_device).lower()
+        compute_lower = (
+            asr_compute_type.lower()
+            if isinstance(asr_compute_type, str)
+            else str(asr_compute_type).lower()
+        )
+        if device_lower.startswith("cuda") and compute_lower == "int8":
+            asr_compute_type = "int8_float16"
+
         asr = ASR(
             model=asr_cfg.get("whisper_model", "large-v3-turbo"),
-            device=asr_cfg.get("device", "cpu"),
-            compute_type=asr_cfg.get("compute_type", "int8"),
+            device=asr_device,
+            compute_type=asr_compute_type,
             task=asr_cfg.get("task", "translate"),
             language=asr_cfg.get("language", "ko"),
             beam_size=preset.beam_size,
@@ -510,6 +540,18 @@ class TranslatorPipeline:
 
         vc_client = self._create_voice_changer()
         self._voice_changer = vc_client
+
+        kokoro_device_value = kokoro_cfg.get("device")
+        if isinstance(kokoro_device_value, str):
+            kokoro_device_clean = kokoro_device_value.strip().lower()
+        else:
+            kokoro_device_clean = str(kokoro_device_value).strip().lower() if kokoro_device_value else ""
+        if kokoro_device_clean in {"", "auto"}:
+            if detected_vram_gb >= 12.0:
+                kokoro_cfg["device"] = "cuda"
+                if "use_half" not in kokoro_cfg:
+                    kokoro_cfg["use_half"] = True
+                logger.info("Detected %.1f GiB VRAM; enabling Kokoro CUDA backend", detected_vram_gb)
 
         tts = KokoroTTS(
             model=kokoro_cfg.get("model", "hexgrad/Kokoro-82M"),

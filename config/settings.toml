@@ -7,7 +7,7 @@ output_device = ""
 [asr]
 whisper_model = "medium" # recommended: large-v3-turbo for accuracy, medium for lower load
 device = "cuda"
-compute_type = "int8"
+compute_type = "float16"  # CUDA acceleration; cpu mode will override to int8
 task = "translate"
 language = "ko"
 beam_size = 2
@@ -41,7 +41,7 @@ volume_db = 10.4
 model = "hexgrad/Kokoro-82M"
 speaker = "af_bella"
 backend = "auto"  # auto | pytorch | onnx
-device = "auto"
+device = "auto"  # auto -> CUDA when >=12 GiB VRAM detected
 use_half = true
 onnx_model = ""
 onnx_providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]

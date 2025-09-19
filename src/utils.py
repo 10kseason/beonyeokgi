@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import re
 import wave
@@ -7,6 +8,9 @@ from typing import Optional
 
 import numpy as np
 from pydub import AudioSegment
+
+
+logger = logging.getLogger("vc-translator.utils")
 
 _HANGUL_RE = re.compile(r"[\u3130-\u318F\uAC00-\uD7A3]")
 _CJK_RE = re.compile(r"[\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]")
@@ -133,4 +137,53 @@ def remove_korean_fillers(text: str) -> str:
     cleaned = _FILLER_RE.sub(" ", text)
     cleaned = re.sub(r"\s+", " ", cleaned, flags=re.UNICODE)
     return cleaned.strip()
+
+
+def detect_max_cuda_vram_gb() -> float:
+    """Return the maximum CUDA device VRAM in gibibytes, or 0 when unavailable."""
+
+    try:
+        import torch  # type: ignore
+    except Exception:
+        return 0.0
+
+    cuda_module = getattr(torch, "cuda", None)
+    if cuda_module is None:
+        return 0.0
+
+    try:
+        is_available = bool(cuda_module.is_available())
+    except Exception:
+        return 0.0
+    if not is_available:
+        return 0.0
+
+    try:
+        device_count = int(cuda_module.device_count())
+    except Exception:
+        device_count = 0
+    if device_count <= 0:
+        device_count = 1
+
+    max_bytes = 0
+    for idx in range(device_count):
+        try:
+            props = cuda_module.get_device_properties(idx)
+        except Exception:
+            logger.debug("Failed to query CUDA device %s properties", idx, exc_info=True)
+            continue
+        total = getattr(props, "total_memory", None)
+        if total is None:
+            continue
+        try:
+            total_bytes = int(total)
+        except Exception:
+            continue
+        if total_bytes > max_bytes:
+            max_bytes = total_bytes
+
+    if max_bytes <= 0:
+        return 0.0
+
+    return max_bytes / float(1024 ** 3)
 
