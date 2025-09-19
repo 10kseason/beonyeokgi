@@ -4,6 +4,8 @@
 - Captures mono 16-bit PCM audio from the selected input device, segments speech with WebRTC VAD (plus optional forced segmentation), normalizes the audio, runs Faster-Whisper with filler removal and fallback translation, then synthesizes Kokoro 82M speech with optional voice conversion and multi-device playback.【F:src/audio_io.py†L10-L76】【F:src/vad.py†L19-L177】【F:src/preprocess.py†L192-L340】【F:src/asr.py†L29-L117】【F:src/pipeline.py†L331-L595】【F:src/tts_kokoro.py†L120-L366】
 - Runtime state (language, preset, devices, latency) is coordinated by a background pipeline thread so the Tk UI can update labels, latency gauges, and device choices without blocking audio processing.【F:src/pipeline.py†L144-L695】【F:src/ui.py†L10-L195】
 
+https://youtu.be/2mpViP17BnQ
+
 ## Documentation
 - [English technical overview](docs/overview.en.md)
 - [한국어 문서](docs/overview.ko.md)
