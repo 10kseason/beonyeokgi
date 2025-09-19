@@ -498,6 +498,7 @@ class TranslatorPipeline:
             input_sr=preproc.target_sr,
             temperature=preset.temperature,
         )
+        asr.set_force_transcribe(self.state.get_llm_translate_active())
         self.state.set_active_language(asr_cfg.get("language", "ko"))
         self.state.set_active_preset(preset.key)
 
@@ -782,6 +783,7 @@ class TranslatorPipeline:
             self._translator_settings["use_llm"] = enabled
             self.state.set_active_llm_translate(enabled)
             self._persist_devices()
+        asr.set_force_transcribe(self.state.get_llm_translate_active())
 
     def _switch_input_device(self, device: Optional[object]) -> None:
         parsed = parse_sd_device(device)

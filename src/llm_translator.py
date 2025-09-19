@@ -41,25 +41,29 @@ class LLMTranslator:
 
     def translate(self, text: str, source_language: str) -> str:
         normalized = (source_language or "").split("-")[0].lower()
-        if not text.strip():
+        stripped = text.strip()
+        if not stripped:
             return ""
         language_name = LANGUAGE_NAMES.get(normalized, normalized or "unknown language")
         prompt = self.cfg.system_prompt.format(language_name=language_name)
-        content = f"Please translate the following {language_name} text into natural English and return only the English translation.\n\n{text.strip()}"
+        content = (
+            f"Please translate the following {language_name} text into natural English and return only the English translation.\n\n"
+            f"{stripped}"
+        )
         backend = (self.cfg.backend or "ollama").strip().lower()
         if backend == "lmstudio":
-            return self._translate_lmstudio(prompt, content)
-        return self._translate_ollama(prompt, content)
+            return self._translate_lmstudio(prompt, content, stripped)
+        return self._translate_ollama(prompt, content, stripped)
 
     # ------------------------------------------------------------------
     # Backend implementations
     # ------------------------------------------------------------------
-    def _translate_ollama(self, prompt: str, content: str) -> str:
+    def _translate_ollama(self, prompt: str, content: str, fallback: str) -> str:
         url = f"{self.cfg.ollama_url.rstrip('/')}/api/generate"
         model = self.cfg.ollama_model or ""
         if not model:
             logger.warning("LLM translator (Ollama) model not configured; skipping translation")
-            return content
+            return fallback
         payload = {
             "model": model,
             "prompt": f"{prompt}\n\nUser: {content}\nTranslator:",
@@ -72,11 +76,11 @@ class LLMTranslator:
             data = resp.json()
         except Exception as exc:
             logger.warning("LLM translator (Ollama) request failed: %s", exc, exc_info=True)
-            return content
+            return fallback
         translated = data.get("response") or data.get("text") or ""
-        return translated.strip() or content
+        return translated.strip() or fallback
 
-    def _translate_lmstudio(self, prompt: str, content: str) -> str:
+    def _translate_lmstudio(self, prompt: str, content: str, fallback: str) -> str:
         base = self.cfg.lmstudio_url.rstrip("/")
         if not base.endswith("/v1"):
             base = f"{base}/v1"
@@ -84,7 +88,7 @@ class LLMTranslator:
         model = self.cfg.lmstudio_model or ""
         if not model:
             logger.warning("LLM translator (LM Studio) model not configured; skipping translation")
-            return content
+            return fallback
         payload = {
             "model": model,
             "messages": [
@@ -99,12 +103,12 @@ class LLMTranslator:
             data = resp.json()
         except Exception as exc:
             logger.warning("LLM translator (LM Studio) request failed: %s", exc, exc_info=True)
-            return content
+            return fallback
         choices = data.get("choices")
         if not choices:
-            return content
+            return fallback
         message = choices[0].get("message") if isinstance(choices[0], dict) else None
         if not message:
-            return content
+            return fallback
         translated = message.get("content", "")
-        return translated.strip() or content
+        return translated.strip() or fallback
