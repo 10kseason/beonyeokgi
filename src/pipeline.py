@@ -15,6 +15,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence
 from .audio_io import MicReader
 from .asr import ASR
 from .preprocess import AudioPreprocessor
+from .llm_translator import LLMTranslator, LLMTranslatorConfig
 from .tts_kokoro import KokoroTTS
 from .utils import contains_cjk, parse_sd_device
 from .vad import VADSegmenter
@@ -153,6 +154,7 @@ class SharedState:
         kokoro_device: Optional[object],
         kokoro_label: str,
         compute_mode: str,
+        llm_translate: bool,
     ) -> None:
         self._lock = threading.Lock()
         self._requested_language = language
@@ -170,6 +172,8 @@ class SharedState:
         self._kokoro_label = kokoro_label or ""
         self._requested_compute_mode = (compute_mode or "auto").strip().lower()
         self._active_compute_mode = self._requested_compute_mode
+        self._requested_llm_translate = bool(llm_translate)
+        self._active_llm_translate = bool(llm_translate)
         self._generation = 0
         self.latency_ms = 0.0
 
@@ -216,6 +220,13 @@ class SharedState:
                 self._requested_compute_mode = normalized
                 self._generation += 1
 
+    def request_llm_translate(self, enabled: bool) -> None:
+        value = bool(enabled)
+        with self._lock:
+            if value != self._requested_llm_translate:
+                self._requested_llm_translate = value
+                self._generation += 1
+
     # ------------------------------------------------------------------
     # Pipeline thread interactions
     # ------------------------------------------------------------------
@@ -234,6 +245,8 @@ class SharedState:
                 "active_kokoro": self._active_kokoro_device,
                 "requested_compute_mode": self._requested_compute_mode,
                 "active_compute_mode": self._active_compute_mode,
+                "requested_llm_translate": self._requested_llm_translate,
+                "active_llm_translate": self._active_llm_translate,
                 "generation": self._generation,
             }
 
@@ -261,6 +274,11 @@ class SharedState:
         normalized = (mode or "auto").strip().lower()
         with self._lock:
             self._active_compute_mode = normalized
+
+    def set_active_llm_translate(self, enabled: bool) -> None:
+        value = bool(enabled)
+        with self._lock:
+            self._active_llm_translate = value
 
     def set_labels(
         self,
@@ -291,6 +309,8 @@ class SharedState:
                 "kokoro_label": self._kokoro_label,
                 "compute_mode": self._requested_compute_mode,
                 "compute_mode_active": self._active_compute_mode,
+                "llm_translate": self._requested_llm_translate,
+                "llm_translate_active": self._active_llm_translate,
             }
 
     def get_active_language(self) -> str:
@@ -317,6 +337,14 @@ class SharedState:
         with self._lock:
             return self._active_compute_mode
 
+    def get_llm_translate_requested(self) -> bool:
+        with self._lock:
+            return self._requested_llm_translate
+
+    def get_llm_translate_active(self) -> bool:
+        with self._lock:
+            return self._active_llm_translate
+
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
 
 
@@ -333,7 +361,7 @@ class TranslatorPipeline:
         self,
         cfg: Dict[str, Any],
         state: SharedState,
-        save_devices: Callable[[Optional[object], Optional[object], Optional[object]], None],
+        save_devices: Callable[[Optional[object], Optional[object], Optional[object], Optional[bool]], None],
     ) -> None:
         self.cfg = cfg
         self.state = state
@@ -349,6 +377,14 @@ class TranslatorPipeline:
         self._current_output_device = state.get_active_output_device()
         self._current_kokoro_device = state.get_active_kokoro_device()
         self._translator_cache: Dict[str, Optional[Any]] = {}
+        self._llm_translator: Optional[LLMTranslator] = None
+        self._llm_translator_key: Optional[tuple] = None
+        translator_cfg = self.cfg.get("translator")
+        if isinstance(translator_cfg, dict):
+            self._translator_settings = translator_cfg
+        else:
+            self._translator_settings = {}
+            self.cfg["translator"] = self._translator_settings
         self._language_targets = {option.code: option.target for option in LANGUAGE_OPTIONS}
         self._forced_segmenter: Optional[ForcedSegmenter] = None
 
@@ -612,6 +648,76 @@ class TranslatorPipeline:
         self._translator_cache[language] = translator
         return translator
 
+    def _get_llm_translator(self) -> Optional[LLMTranslator]:
+        settings = self._translator_settings
+        if not settings:
+            return None
+
+        cfg = LLMTranslatorConfig()
+
+        backend_value = settings.get("llm_backend", settings.get("backend"))
+        if isinstance(backend_value, str) and backend_value.strip():
+            cfg.backend = backend_value.strip().lower()
+
+        def _coerce_float(value: Any, default: float) -> float:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return default
+
+        timeout_value = settings.get("timeout_sec", settings.get("timeout"))
+        cfg.timeout_sec = _coerce_float(timeout_value, cfg.timeout_sec)
+        cfg.temperature = _coerce_float(settings.get("temperature"), cfg.temperature)
+
+        system_prompt = settings.get("system_prompt")
+        if isinstance(system_prompt, str) and system_prompt.strip():
+            cfg.system_prompt = system_prompt
+
+        ollama_section = settings.get("ollama")
+        if isinstance(ollama_section, dict):
+            base = ollama_section.get("base_url")
+            if isinstance(base, str) and base.strip():
+                cfg.ollama_url = base.strip()
+            model = ollama_section.get("model")
+            if isinstance(model, str) and model.strip():
+                cfg.ollama_model = model.strip()
+        base_url = settings.get("ollama_url")
+        if isinstance(base_url, str) and base_url.strip():
+            cfg.ollama_url = base_url.strip()
+        model_name = settings.get("ollama_model")
+        if isinstance(model_name, str) and model_name.strip():
+            cfg.ollama_model = model_name.strip()
+
+        lmstudio_section = settings.get("lmstudio")
+        if isinstance(lmstudio_section, dict):
+            base = lmstudio_section.get("base_url")
+            if isinstance(base, str) and base.strip():
+                cfg.lmstudio_url = base.strip()
+            model = lmstudio_section.get("model")
+            if isinstance(model, str) and model.strip():
+                cfg.lmstudio_model = model.strip()
+        base_url = settings.get("lmstudio_url")
+        if isinstance(base_url, str) and base_url.strip():
+            cfg.lmstudio_url = base_url.strip()
+        model_name = settings.get("lmstudio_model")
+        if isinstance(model_name, str) and model_name.strip():
+            cfg.lmstudio_model = model_name.strip()
+
+        key = (
+            cfg.backend,
+            cfg.timeout_sec,
+            cfg.system_prompt,
+            cfg.ollama_url,
+            cfg.ollama_model,
+            cfg.lmstudio_url,
+            cfg.lmstudio_model,
+            cfg.temperature,
+        )
+        if self._llm_translator is None or self._llm_translator_key != key:
+            self._llm_translator = LLMTranslator(cfg)
+            self._llm_translator_key = key
+        return self._llm_translator
+
     def _ensure_english_text(self, text: str, language: Optional[str]) -> str:
         normalized = self._normalize_language(language)
         if not normalized:
@@ -621,6 +727,17 @@ class TranslatorPipeline:
             return text
         if not contains_cjk(text):
             return text
+        if self.state.get_llm_translate_active():
+            llm_translator = self._get_llm_translator()
+            if llm_translator is not None:
+                try:
+                    translated = llm_translator.translate(text, normalized)
+                except Exception:
+                    logger.warning("LLM translator failed", exc_info=True)
+                else:
+                    translated = translated.strip()
+                    if translated and (translated != text or not contains_cjk(translated)):
+                        return translated
         translator = self._get_translator(normalized)
         if translator is None:
             return text
@@ -658,6 +775,13 @@ class TranslatorPipeline:
             self._switch_output_device(cfg["requested_output"], tts)
         if cfg["requested_kokoro"] != cfg["active_kokoro"]:
             self._switch_kokoro_passthrough(cfg["requested_kokoro"], tts)
+        if cfg["requested_llm_translate"] != cfg["active_llm_translate"]:
+            enabled = bool(cfg["requested_llm_translate"])
+            self._llm_translator = None
+            self._llm_translator_key = None
+            self._translator_settings["use_llm"] = enabled
+            self.state.set_active_llm_translate(enabled)
+            self._persist_devices()
 
     def _switch_input_device(self, device: Optional[object]) -> None:
         parsed = parse_sd_device(device)
@@ -699,6 +823,7 @@ class TranslatorPipeline:
                 self._current_input_device,
                 self._current_output_device,
                 self._current_kokoro_device,
+                self.state.get_llm_translate_requested(),
             )
         except Exception:
             logger.debug("Failed to persist devices", exc_info=True)

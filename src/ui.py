@@ -15,6 +15,7 @@ class TranslatorUI:
         on_change_output: Callable[[], None],
         on_change_kokoro: Callable[[], None],
         on_change_compute: Callable[[str], None],
+        on_toggle_llm: Callable[[bool], None],
         on_sync_kokoro: Callable[[], None],
         on_close: Callable[[], None],
     ) -> None:
@@ -23,6 +24,7 @@ class TranslatorUI:
         self._output_callback = on_change_output
         self._kokoro_callback = on_change_kokoro
         self._compute_callback = on_change_compute
+        self._llm_callback = on_toggle_llm
         self._sync_kokoro_callback = on_sync_kokoro
         self._close_callback = on_close
 
@@ -46,6 +48,7 @@ class TranslatorUI:
         self.language_var = tk.StringVar(value=self._language_labels.get(snapshot.get("language", "ko"), "Korean -> EN"))
         self.preset_var = tk.StringVar(value=self._preset_labels.get(snapshot.get("preset", "latency"), "Low latency"))
         self.compute_var = tk.StringVar(value=self._compute_labels.get(snapshot.get("compute_mode", "auto"), "Auto"))
+        self.llm_var = tk.BooleanVar(value=bool(snapshot.get("llm_translate", False)))
         self.latency_value_var = tk.StringVar(value="0 ms")
 
         self._build()
@@ -94,6 +97,13 @@ class TranslatorUI:
         )
         lang_box.grid(row=0, column=1, padx=(12, 0), sticky="w")
         lang_box.bind("<<ComboboxSelected>>", self._on_language_selected)
+
+        ttk.Checkbutton(
+            lang_frame,
+            text="Use LLM translator (Ollama / LM Studio)",
+            variable=self.llm_var,
+            command=self._on_llm_toggle,
+        ).grid(row=1, column=0, columnspan=2, pady=(8, 0), sticky="w")
 
         # Compute mode
         compute_frame = ttk.LabelFrame(frame, text="Compute mode", padding=(12, 8))
@@ -145,6 +155,9 @@ class TranslatorUI:
         if mode:
             self._compute_callback(mode)
 
+    def _on_llm_toggle(self) -> None:
+        self._llm_callback(bool(self.llm_var.get()))
+
     def _on_preset_changed(self) -> None:
         label = self.preset_var.get()
         for key, display in self._preset_labels.items():
@@ -186,10 +199,13 @@ class TranslatorUI:
 
         preset_label = self._preset_labels.get(snap.get("preset", "latency"), self.preset_var.get())
         compute_label = self._compute_labels.get(snap.get("compute_mode", "auto"), self.compute_var.get())
+        llm_state = bool(snap.get("llm_translate", self.llm_var.get()))
         if self.compute_var.get() != compute_label:
             self.compute_var.set(compute_label)
         if self.preset_var.get() != preset_label:
             self.preset_var.set(preset_label)
+        if bool(self.llm_var.get()) != llm_state:
+            self.llm_var.set(llm_state)
 
         self.root.after(200, self._refresh)
 

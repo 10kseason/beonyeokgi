@@ -1,13 +1,13 @@
 # 실시간 음성 번역기 – 기술 개요 (한국어)
 
 ## 개요
-이 애플리케이션은 선택한 입력 장치에서 모노 16비트 PCM 오디오를 받아 말하기 구간을 검출한 뒤, 한국어 군더더기 제거가 포함된 Whisper 기반 음성 인식과 필요 시 Helsinki-NLP 번역을 수행하고, Kokoro 82M 음성 합성 결과를 재생합니다. 음성 변환(VC) 연동은 옵션이며, 모든 상태 관리는 UI와 분리된 파이프라인 스레드가 담당해 전체 지연 시간을 추적합니다.【F:src/audio_io.py†L10-L76】【F:src/vad.py†L19-L177】【F:src/asr.py†L29-L147】【F:src/pipeline.py†L331-L595】
+이 애플리케이션은 선택한 입력 장치에서 모노 16비트 PCM 오디오를 받아 말하기 구간을 검출한 뒤, 한국어 군더더기 제거가 포함된 Whisper 기반 음성 인식과 필요 시 Helsinki-NLP 또는 LLM(ollama/LM Studio) 번역을 수행하고, Kokoro 82M 음성 합성 결과를 재생합니다. 음성 변환(VC) 연동은 옵션이며, 모든 상태 관리는 UI와 분리된 파이프라인 스레드가 담당해 전체 지연 시간을 추적합니다.【F:src/audio_io.py†L10-L76】【F:src/vad.py†L19-L177】【F:src/asr.py†L29-L147】【F:src/pipeline.py†L331-L639】【F:src/llm_translator.py†L1-L96】
 
 ## 신호 흐름
 1. **캡처:** `MicReader`가 `sounddevice.RawInputStream`을 이용해 고정 크기 프레임을 큐에 쌓아, 콜백이 막히지 않도록 합니다.【F:src/audio_io.py†L10-L76】
 2. **분할:** `VADSegmenter`는 프레임 길이, 민감도, 최대 발화 길이, 청크 스트리밍을 설정할 수 있는 WebRTC VAD를 사용합니다. `ForcedSegmenter`를 켜면 RMS 기반으로 VAD가 놓친 긴 발화를 강제로 잘라냅니다.【F:src/vad.py†L19-L177】【F:src/pipeline.py†L405-L545】
 3. **전처리:** `AudioPreprocessor`는 ffmpeg(가능하면) 또는 내부 보간기로 16kHz로 리샘플링한 뒤 90Hz 하이패스와 7.2kHz 로우패스를 거치고, 라우드니스 정규화·트루픽 제한·완만한 컴프레서를 적용합니다.【F:src/preprocess.py†L192-L340】
-4. **인식:** ASR 래퍼는 PCM을 float32로 바꾼 뒤 Faster-Whisper를 호출하고, 한국어 군더더기를 제거한 뒤 필요하면 ko/ja/zh → en Helsinki-NLP 모델로 후처리합니다.【F:src/asr.py†L29-L117】【F:src/pipeline.py†L556-L639】【F:src/translator.py†L10-L66】
+4. **인식:** ASR 래퍼는 PCM을 float32로 바꾼 뒤 Faster-Whisper를 호출하고, 한국어 군더더기를 제거한 뒤 필요하면 ko/ja/zh → en Helsinki-NLP 모델 또는 GUI에서 LLM 번역 모드를 켰을 때 Ollama/LM Studio 백엔드로 후처리합니다.【F:src/asr.py†L29-L117】【F:src/pipeline.py†L556-L639】【F:src/translator.py†L10-L66】【F:src/llm_translator.py†L1-L96】
 5. **합성:** `KokoroTTS`는 짧은 문장을 모아 배치 처리하고, 교차 페이드로 이어 붙이며, 메인 출력·패스스루 가상 마이크·VC 실패 시 폴백 장치로 동시에 출력할 수 있습니다.【F:src/tts_kokoro.py†L120-L246】【F:src/tts_kokoro.py†L320-L366】【F:src/tts_kokoro.py†L428-L553】
 6. **음성 변환(선택):** 활성화하면 파이프라인이 `VoiceChangerClient`를 생성하여 Ookada VC Client API에 int16 청크를 업로드하고, 샘플레이트 협상·스트리밍·WAV 저장을 처리합니다.【F:src/pipeline.py†L706-L739】【F:src/voice_changer_client.py†L21-L184】
 7. **상태/GUI:** `SharedState`가 언어·프리셋·장치·지연 시간을 동기화하고, `TranslatorUI`는 장치/프리셋/연산 모드/Kokoro 미러링을 실시간으로 변경할 수 있는 Tk 인터페이스를 제공합니다.【F:src/pipeline.py†L144-L695】【F:src/ui.py†L10-L195】

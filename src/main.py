@@ -220,6 +220,7 @@ def _save_devices_local(
     output_dev: Optional[object],
     kokoro_dev: Optional[object],
     compute_mode: Optional[str] = None,
+    llm_translate: Optional[bool] = None,
 ) -> None:
     base_dir = os.path.dirname(cfg_path)
     local_path = os.path.join(base_dir, "local.toml")
@@ -287,6 +288,15 @@ def _save_devices_local(
         data["app"] = app_section
     else:
         data.pop("app", None)
+
+    translator_section = data.get("translator", {}) if isinstance(data.get("translator"), dict) else {}
+    translator_section = translator_section.copy() if isinstance(translator_section, dict) else {}
+    if llm_translate is not None:
+        translator_section["use_llm"] = bool(llm_translate)
+    if translator_section:
+        data["translator"] = translator_section
+    else:
+        data.pop("translator", None)
 
     if not data:
         if os.path.exists(local_path):
@@ -410,6 +420,12 @@ def run_app(cfg_path: str, args: Optional[argparse.Namespace]) -> None:
     asr_cfg = cfg.setdefault("asr", {})
     app_cfg = cfg.setdefault("app", {})
     kokoro_cfg = cfg.setdefault("kokoro", {})
+    translator_cfg = cfg.get("translator")
+    if not isinstance(translator_cfg, dict):
+        translator_cfg = {}
+        cfg["translator"] = translator_cfg
+    llm_enabled = bool(translator_cfg.get("use_llm", False))
+    translator_cfg["use_llm"] = llm_enabled
 
     preferred_mode = str(app_cfg.get("compute_mode", "auto") or "auto").strip().lower()
     stored_mode, effective_mode = _configure_acceleration(cfg, preferred_mode)
@@ -452,7 +468,7 @@ def run_app(cfg_path: str, args: Optional[argparse.Namespace]) -> None:
     output_label = describe_device(output_device)
     kokoro_label = describe_optional_device(kokoro_passthrough)
     kokoro_save = kokoro_passthrough if kokoro_passthrough not in ("",) else None
-    _save_devices_local(cfg_path, input_device, output_device, kokoro_save, stored_mode)
+    _save_devices_local(cfg_path, input_device, output_device, kokoro_save, stored_mode, llm_enabled)
 
     state = SharedState(
         language,
@@ -464,14 +480,19 @@ def run_app(cfg_path: str, args: Optional[argparse.Namespace]) -> None:
         kokoro_passthrough,
         kokoro_label,
         stored_mode,
+        llm_enabled,
     )
     state.set_active_compute_mode(effective_mode)
     state.set_labels(input_label, output_label, kokoro_label)
 
     def save_devices_callback(
-        inp: Optional[object], out: Optional[object], kokoro: Optional[object]
+        inp: Optional[object],
+        out: Optional[object],
+        kokoro: Optional[object],
+        llm_mode: Optional[bool],
     ) -> None:
-        _save_devices_local(cfg_path, inp, out, kokoro, state.get_active_compute_mode())
+        llm_value = state.get_llm_translate_requested() if llm_mode is None else bool(llm_mode)
+        _save_devices_local(cfg_path, inp, out, kokoro, state.get_active_compute_mode(), llm_value)
 
     pipeline = TranslatorPipeline(cfg, state, save_devices_callback)
 
@@ -524,6 +545,7 @@ def run_app(cfg_path: str, args: Optional[argparse.Namespace]) -> None:
             state.get_active_output_device(),
             state.get_active_kokoro_device(),
             stored_mode_ref,
+            state.get_llm_translate_requested(),
         )
         pipeline.stop()
         pipeline = TranslatorPipeline(cfg, state, save_devices_callback)
@@ -536,6 +558,18 @@ def run_app(cfg_path: str, args: Optional[argparse.Namespace]) -> None:
         label = describe_device(target)
         state.request_kokoro_device(target, label)
 
+    def on_toggle_llm(enabled: bool) -> None:
+        translator_cfg["use_llm"] = bool(enabled)
+        state.request_llm_translate(enabled)
+        _save_devices_local(
+            cfg_path,
+            state.get_active_input_device(),
+            state.get_active_output_device(),
+            state.get_active_kokoro_device(),
+            state.get_active_compute_mode(),
+            bool(enabled),
+        )
+
     def on_close() -> None:
         pipeline.stop()
 
@@ -545,6 +579,7 @@ def run_app(cfg_path: str, args: Optional[argparse.Namespace]) -> None:
         on_change_output,
         on_change_kokoro,
         on_change_compute_mode,
+        on_toggle_llm,
         on_sync_kokoro_to_output,
         on_close,
     )
