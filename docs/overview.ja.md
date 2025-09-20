@@ -1,5 +1,40 @@
 # リアルタイム音声翻訳 – 技術概要 (日本語)
 
+リアルタイム音声翻訳 (プレビュー) (Windows)
+⚠️ プレビューに関する警告: このプロジェクトは、評価のみを目的とした早期プレビュー版です。仕様の破壊的変更、機能の不足、不安定性が予想されますので、製品版やミッションクリティカルなワークフローでのご使用はお控えください。
+
+ご使用になるには、すべてのドキュメントをお読みください！
+
+CUDAのみを使用したい場合 = for_nvidia-gpu-run.bat を実行し、
+
+requirements.txt を requirements_nvidia.txt に置き換えてください。
+
+そして、設定を変更してください。
+local.toml ファイル内
+
+Ini, TOML
+
+[app]
+compute_mode = "cuda"
+.......
+そして
+
+settings.toml ファイル内
+
+Ini, TOML
+
+[asr]
+device = "cuda"
+compute_type = "float16"
+.......
+そして
+
+Ini, TOML
+
+[kokoro]
+backend = "pytorch"
+device = "cuda"
+
 ## 概要
 本アプリケーションは選択した入力デバイスからモノラル16bit PCM音声を取得し、発話区間を検出してからWhisperベースの音声認識を実行します。韓国語フィラー除去やHelsinki-NLPによるko/ja/zh→英語訳、またはGUIでLLMモードを有効にした際はOllama／LM Studioバックエンドによる翻訳を行い、Kokoro 82Mによる音声合成を再生します。音声変換(VCC)連携は任意で、UIとは別スレッドのパイプラインが全体の状態と遅延を管理します。【F:src/audio_io.py†L10-L76】【F:src/vad.py†L19-L177】【F:src/asr.py†L29-L147】【F:src/pipeline.py†L331-L639】【F:src/llm_translator.py†L1-L96】
 
