@@ -9,8 +9,10 @@
 [![Watch the video](preview.gif)](https://youtu.be/2mpViP17BnQ)
 
 
-Click on the GIF to go to the YouTube video.
+(CPU Whisper + KOKORO TTS/ LLM inferrence =CUDA)Click on the GIF to go to the YouTube video.
 
+
+https://youtu.be/6kSL6WAV_mo(CUDA Inference ONLY)
 ## Documentation
 - [English technical overview](docs/overview.en.md)
 - [한국어 문서](docs/overview.ko.md)
