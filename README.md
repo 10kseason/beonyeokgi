@@ -14,10 +14,10 @@ compute_mode = "cuda"
 
 AND 
 
-IN
 
 settings.toml
 
+IN
 
 [asr]
 device = "cuda"
