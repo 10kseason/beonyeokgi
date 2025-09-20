@@ -40,8 +40,8 @@ volume_db = 10.4
 [kokoro]
 model = "hexgrad/Kokoro-82M"
 speaker = "af_bella"
-backend = "auto"  # auto | pytorch | onnx
-device = "auto"  # auto -> CUDA when >=12 GiB VRAM detected
+backend = "pytorch"  # auto | pytorch | onnx
+device = "cuda"  # auto -> CUDA when >=12 GiB VRAM detected
 use_half = true
 onnx_model = ""
 onnx_providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
@@ -66,6 +66,7 @@ estimate_max_ms = 20000.0
 
 [app]
 preset = "accuracy"
+compute_mode = "cuda"
 
 [translator]
 use_llm = true

@@ -3,7 +3,7 @@ input_device = 1
 output_device = 10
 
 [app]
-compute_mode = "cpu"
+compute_mode = "cuda"
 
 [translator]
 use_llm = true
