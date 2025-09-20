@@ -2,7 +2,11 @@
 
 > **⚠️ PREVIEW WARNING:** This project is an early preview build intended for evaluation only. Expect breaking changes, missing features, and instability; do **not** rely on it for production or mission-critical workflows.
 
-IF YOU WANT USE ONLY CUDA = run for_nvidia-gpu-run.bat and change to config
+IF YOU WANT USE ONLY CUDA = run for_nvidia-gpu-run.bat 
+
+and replace requirements.txt to requirements_nvidia.txt
+
+and change to config
 IN local.toml 
 
  
