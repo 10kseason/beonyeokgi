@@ -1,5 +1,39 @@
 # 실시간 음성 번역기 – 기술 개요 (한국어)
 
+⚠️ 미리보기 경고: 이 프로젝트는 평가용으로만 제작된 초기 미리보기 빌드입니다. 예기치 않은 변경, 기능 누락, 불안정성이 있을 수 있으므로, 프로덕션 또는 미션 크리티컬 워크플로우에 사용하지 마십시오.
+
+사용하시려면 모든 문서를 읽어주세요!
+
+만약 CUDA만 사용하고 싶으시다면 = for_nvidia-gpu-run.bat 파일을 실행하시고
+
+requirements.txt를 requirements_nvidia.txt로 교체해주세요.
+
+그리고 설정을 변경해야 합니다.
+local.toml 파일에서
+
+Ini, TOML
+
+[app]
+compute_mode = "cuda"
+.......
+그리고
+
+settings.toml 파일에서
+
+Ini, TOML
+
+[asr]
+device = "cuda"
+compute_type = "float16"
+.......
+그리고
+
+Ini, TOML
+
+[kokoro]
+backend = "pytorch"
+device = "cuda"
+
 ## 개요
 이 애플리케이션은 선택한 입력 장치에서 모노 16비트 PCM 오디오를 받아 말하기 구간을 검출한 뒤, 한국어 군더더기 제거가 포함된 Whisper 기반 음성 인식과 필요 시 Helsinki-NLP 또는 LLM(ollama/LM Studio) 번역을 수행하고, Kokoro 82M 음성 합성 결과를 재생합니다. 음성 변환(VC) 연동은 옵션이며, 모든 상태 관리는 UI와 분리된 파이프라인 스레드가 담당해 전체 지연 시간을 추적합니다.【F:src/audio_io.py†L10-L76】【F:src/vad.py†L19-L177】【F:src/asr.py†L29-L147】【F:src/pipeline.py†L331-L639】【F:src/llm_translator.py†L1-L96】
 
