@@ -72,7 +72,7 @@ Faster-Whisper, WebRTC VAD, sounddevice, Kokoro 런타임, Edge/Piper TTS, PyTor
 - `[device]`: 기본 샘플레이트와 장치 ID. UI가 저장/불러오기 합니다.【F:config/settings.toml†L1-L5】【F:src/main.py†L217-L305】
 - `[asr]`: Whisper 모델, 디바이스/정밀도, 언어 고정, 디코딩 옵션.【F:config/settings.toml†L7-L15】【F:src/asr.py†L29-L147】
 - `[vad]`, `[vad.force]`: VAD 민감도, 침묵 패드, 청크 스트리밍, 강제 분할 임계값.【F:config/settings.toml†L17-L30】【F:src/vad.py†L19-L177】【F:src/pipeline.py†L405-L545】
-- `[tts]`, `[kokoro]`: Kokoro 백엔드/보이스, 배치·크로스페이드 타이밍, 출력 볼륨, 패스스루 장치 설정.【F:config/settings.toml†L33-L58】【F:src/tts_kokoro.py†L120-L553】
+- `[tts]`, `[kokoro]`: Kokoro 백엔드/보이스, 배치·크로스페이드 타이밍, 출력 볼륨, 재생 장치 오버라이드, 패스스루 장치 설정.【F:config/settings.toml†L33-L58】【F:src/tts_kokoro.py†L120-L553】【F:src/pipeline.py†L405-L595】
 - `[app]`: 기본 프리셋(`latency`/`accuracy`)과 연산 모드 지정. 런타임에서 CUDA 가용성에 맞춰 조정됩니다.【F:config/settings.toml†L60-L61】【F:src/main.py†L369-L530】
 - `[voice_changer]`: 기본값이 `false`라서 VCC 내보내기가 꺼져 있습니다. `enabled = true`로 바꾸면 엔드포인트, 샘플레이트, 스트리밍 청크 길이, 폴백 출력 장치를 설정할 수 있습니다.【F:config/settings.toml†L67-L79】【F:src/pipeline.py†L706-L739】【F:src/voice_changer_client.py†L21-L184】
 

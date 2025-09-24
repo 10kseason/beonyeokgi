@@ -43,6 +43,7 @@ speaker = "af_bella"
 backend = "pytorch"  # auto | pytorch | onnx
 device = "cuda"  # auto -> CUDA when >=12 GiB VRAM detected
 use_half = true
+output_device = ""  # Optional: override Kokoro playback target (defaults to [device].output_device)
 onnx_model = ""
 onnx_providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
 execution_provider = ""

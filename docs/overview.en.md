@@ -38,7 +38,7 @@ Edit `config/settings.toml` (and override in `config/local.toml`) to control run
 - `[device]`: default input/output sample rates and device identifiers saved by the UI.【F:config/settings.toml†L1-L5】【F:src/main.py†L217-L305】
 - `[asr]`: Whisper model, device/compute type, language lock, and decoding hyperparameters.【F:config/settings.toml†L7-L15】【F:src/asr.py†L29-L147】
 - `[vad]` and `[vad.force]`: VAD aggressiveness, silence padding, chunk streaming, and forced segmentation thresholds.【F:config/settings.toml†L17-L30】【F:src/vad.py†L19-L177】【F:src/pipeline.py†L405-L545】
-- `[tts]` and `[kokoro]`: Kokoro backend, speaker, batching/crossfade timings, output volume, and optional passthrough input device for virtual-mic mirroring.【F:config/settings.toml†L33-L58】【F:src/tts_kokoro.py†L120-L553】
+- `[tts]` and `[kokoro]`: Kokoro backend, speaker, batching/crossfade timings, output volume, optional playback device override, and passthrough input device for virtual-mic mirroring.【F:config/settings.toml†L33-L58】【F:src/tts_kokoro.py†L120-L553】【F:src/pipeline.py†L405-L595】
 - `[app]`: default preset (`latency` or `accuracy`) and compute mode selection that maps to CPU or CUDA at runtime.【F:config/settings.toml†L60-L61】【F:src/main.py†L369-L530】
 - `[voice_changer]`: Disabled by default—VCC export is inactive until you set `enabled = true`. When activated you can choose endpoints, sample rates, streaming chunk length, and fallback playback device.【F:config/settings.toml†L67-L79】【F:src/pipeline.py†L706-L739】【F:src/voice_changer_client.py†L21-L184】
 

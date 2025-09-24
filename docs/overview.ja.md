@@ -73,7 +73,7 @@ Faster-Whisper、WebRTC VAD、sounddevice、Kokoro ランタイム、Edge/Piper 
 - `[device]`: 既定のサンプルレートとデバイス ID。UI が保存／復元します。【F:config/settings.toml†L1-L5】【F:src/main.py†L217-L305】
 - `[asr]`: Whisper モデル、デバイス／演算形式、言語ロック、デコード設定。【F:config/settings.toml†L7-L15】【F:src/asr.py†L29-L147】
 - `[vad]`, `[vad.force]`: VAD 感度、サイレンスパッド、チャンクストリーミング、強制分割の閾値。【F:config/settings.toml†L17-L30】【F:src/vad.py†L19-L177】【F:src/pipeline.py†L405-L545】
-- `[tts]`, `[kokoro]`: Kokoro バックエンド／スピーカー、バッチ／クロスフェード設定、出力音量、パススルーデバイス。【F:config/settings.toml†L33-L58】【F:src/tts_kokoro.py†L120-L553】
+- `[tts]`, `[kokoro]`: Kokoro バックエンド／スピーカー、バッチ／クロスフェード設定、出力音量、再生デバイス上書き、パススルーデバイス。【F:config/settings.toml†L33-L58】【F:src/tts_kokoro.py†L120-L553】【F:src/pipeline.py†L405-L595】
 - `[app]`: 既定プリセット (`latency` / `accuracy`) と計算モード。実行時に CUDA の有無を確認して切り替えます。【F:config/settings.toml†L60-L61】【F:src/main.py†L369-L530】
 - `[voice_changer]`: 既定で `false` のため VCC 出力は無効です。`enabled = true` にするとエンドポイントやサンプルレート、ストリームチャンク、フォールバック出力を設定できます。【F:config/settings.toml†L67-L79】【F:src/pipeline.py†L706-L739】【F:src/voice_changer_client.py†L21-L184】
 

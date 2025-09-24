@@ -377,6 +377,7 @@ class TranslatorPipeline:
         self._current_input_device = state.get_active_input_device()
         self._current_output_device = state.get_active_output_device()
         self._current_kokoro_device = state.get_active_kokoro_device()
+        self._kokoro_output_override: Optional[object] = None
         self._translator_cache: Dict[str, Optional[Any]] = {}
         self._llm_translator: Optional[LLMTranslator] = None
         self._llm_translator_key: Optional[tuple] = None
@@ -436,8 +437,12 @@ class TranslatorPipeline:
         input_device = device_cfg.get("input_device")
         output_device = device_cfg.get("output_device")
         kokoro_passthrough = kokoro_cfg.get("passthrough_input_device")
+        self._kokoro_output_override = self._normalize_output_override(
+            kokoro_cfg.get("output_device")
+        )
+        parsed_output_device = parse_sd_device(output_device)
         self._current_input_device = input_device
-        self._current_output_device = output_device
+        self._current_output_device = parsed_output_device
         self._current_kokoro_device = kokoro_passthrough
 
         detected_vram_gb = detect_max_cuda_vram_gb()
@@ -565,7 +570,11 @@ class TranslatorPipeline:
             pace=float(self.cfg.get("tts", {}).get("pace", 1.0) or 1.0),
             volume_db=float(self.cfg.get("tts", {}).get("volume_db", 0.0) or 0.0),
             out_sr=output_sr,
-            output_device=output_device,
+            output_device=(
+                self._kokoro_output_override
+                if self._kokoro_output_override is not None
+                else parsed_output_device
+            ),
             passthrough_input_device=kokoro_passthrough,
             voice_changer=vc_client,
             short_threshold_ms=float(kokoro_cfg.get("short_threshold_ms", 500.0)),
@@ -585,6 +594,23 @@ class TranslatorPipeline:
             dynamic_max_target_ms=float(kokoro_cfg.get("dynamic_max_target_ms", 20000.0)),
             estimate_max_ms=float(kokoro_cfg.get("estimate_max_ms", kokoro_cfg.get("max_estimate_ms", 20000.0))),
         )
+        if self._kokoro_output_override is not None:
+            logger.info("Routing Kokoro playback to override device %s", self._kokoro_output_override)
+
+        default_output_target = (
+            self._kokoro_output_override
+            if self._kokoro_output_override is not None
+            else parsed_output_device
+        )
+        if (
+            vc_client is not None
+            and vc_client.cfg.fallback_output_device in (None, "", "default")
+        ):
+            normalized_fallback = self._normalize_output_override(default_output_target)
+            vc_client.cfg.fallback_output_device = (
+                normalized_fallback if normalized_fallback not in (None, "") else None
+            )
+
         self._tts = tts
         self.state.set_active_kokoro_device(kokoro_passthrough)
         self._subtitle_streamer = self._create_subtitle_streamer()
@@ -945,11 +971,29 @@ class TranslatorPipeline:
         parsed = parse_sd_device(device)
         self._current_output_device = parsed
         self.cfg.setdefault("device", {})["output_device"] = parsed
-        tts.set_output_device(parsed)
+        target_device = (
+            self._kokoro_output_override
+            if self._kokoro_output_override is not None
+            else parsed
+        )
+        tts.set_output_device(target_device)
         if self._voice_changer is not None:
-            self._voice_changer.cfg.fallback_output_device = parsed if parsed not in ("", None) else None
+            fallback_device = self._normalize_output_override(target_device)
+            self._voice_changer.cfg.fallback_output_device = (
+                fallback_device if fallback_device not in (None, "") else None
+            )
         self.state.set_active_output_device(device)
         self._persist_devices()
+
+    def _normalize_output_override(self, value: Optional[object]) -> Optional[object]:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped or stripped.lower() == "default":
+                return None
+            return parse_sd_device(stripped)
+        return parse_sd_device(value)
 
     def _switch_kokoro_passthrough(self, device: Optional[object], tts: KokoroTTS) -> None:
         parsed = parse_sd_device(device)
