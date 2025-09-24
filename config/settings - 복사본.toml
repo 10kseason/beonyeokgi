@@ -33,6 +33,7 @@ speaker = "af_bella"
 backend = "auto"  # auto | pytorch | onnx
 device = "auto"
 use_half = true
+output_device = ""  # Optional: override Kokoro playback target (defaults to [device].output_device)
 onnx_model = ""
 onnx_providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
 execution_provider = ""
