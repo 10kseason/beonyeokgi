@@ -368,8 +368,16 @@ class KokoroTTS:
             try:
                 audio_f32, sample_rate = runtime(text)
             except Exception as exc:
-                logger.error("Kokoro synthesis failed: %s", exc)
-                return None
+                if self._try_recover_from_exception(exc):
+                    try:
+                        runtime = self._ensure_runtime()
+                        audio_f32, sample_rate = runtime(text)
+                    except Exception as retry_exc:
+                        logger.error("Kokoro synthesis retry failed: %s", retry_exc)
+                        return None
+                else:
+                    logger.error("Kokoro synthesis failed: %s", exc)
+                    return None
         finally:
             self._pending_target_ms = previous_target
         synth_elapsed = time.perf_counter() - synth_start
@@ -930,6 +938,37 @@ class KokoroTTS:
             except Exception as exc:
                 logger.debug("Kokoro warmup skipped: %s", exc)
                 break
+
+    def _try_recover_from_exception(self, exc: Exception) -> bool:
+        if not self._is_half_precision_error(exc):
+            return False
+        if not self._disable_half_precision():
+            return False
+        logger.warning(
+            "Disabling Kokoro half precision after runtime dtype mismatch: %s", exc
+        )
+        return True
+
+    def _is_half_precision_error(self, exc: Exception) -> bool:
+        message = str(exc).lower()
+        if not message or "half" not in message:
+            return False
+        indicators = ("same dtype", "dtype", "scalar type", "found input tensor")
+        return any(indicator in message for indicator in indicators)
+
+    def _disable_half_precision(self) -> bool:
+        changed = False
+        if bool(self.cfg.use_half):
+            self.cfg.use_half = False
+            changed = True
+        for plan in self._plans:
+            if plan.use_half:
+                plan.use_half = False
+                plan.runtime = None
+                changed = True
+        if changed:
+            self._runtime = None
+        return changed
 
     # ------------------------------------------------------------------
     # PyTorch backend
