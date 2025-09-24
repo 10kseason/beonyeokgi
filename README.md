@@ -56,7 +56,7 @@ device = "cuda"
 (CPU Whisper + KOKORO TTS/ LLM inferrence =CUDA)Click on the GIF to go to the YouTube video.
 
 
-https://youtu.be/6kSL6WAV_mo   (CUDA Inference ONLY)
+  (CUDA Inference ONLY)
 ## Documentation
 - [English technical overview](docs/overview.en.md)
 - [한국어 문서](docs/overview.ko.md)
