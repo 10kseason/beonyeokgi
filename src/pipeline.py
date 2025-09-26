@@ -827,13 +827,19 @@ class TranslatorPipeline:
 
         timeout_value = settings.get("timeout_sec", settings.get("timeout"))
         cfg.timeout_sec = _coerce_float(timeout_value, cfg.timeout_sec)
-        cfg.temperature = 0.2
+        if cfg.timeout_sec <= 0.0:
+            cfg.timeout_sec = LLMTranslatorConfig().timeout_sec
+        settings["timeout_sec"] = cfg.timeout_sec
+
+        temperature_value = settings.get("temperature")
+        cfg.temperature = _coerce_float(temperature_value, cfg.temperature)
+        if cfg.temperature < 0.0:
+            cfg.temperature = 0.0
         settings["temperature"] = cfg.temperature
 
         system_prompt = settings.get("system_prompt")
         if isinstance(system_prompt, str) and system_prompt.strip():
             cfg.system_prompt = system_prompt
-
         ollama_section = settings.get("ollama")
         if isinstance(ollama_section, dict):
             base = ollama_section.get("base_url")
