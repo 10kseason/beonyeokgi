@@ -55,8 +55,9 @@ device = "cuda"
 
 (CPU Whisper + KOKORO TTS/ LLM inferrence =CUDA)Click on the GIF to go to the YouTube video.
 
+https://youtu.be/4qwZs9yZUzk <- medium + KOKORO TTS + 4B LLM (settings for 8GB VRAM CUDA)
 
-  (CUDA Inference ONLY)
+https://youtu.be/mefRizr0F-0 <- Large v3 turbo + KOKORO TTS + 4B LLM (OVER 10GB+ VRAM with CUDA)  (CUDA Inference ONLY)
 ## Documentation
 - [English technical overview](docs/overview.en.md)
 - [한국어 문서](docs/overview.ko.md)
